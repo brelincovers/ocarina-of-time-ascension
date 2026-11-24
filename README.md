@@ -1,5 +1,13 @@
 # nxnative
 
+## Install Ocarina of Time Ascension on a Mac
+
+1. [Download Ascension Installer](https://raw.githubusercontent.com/brelincovers/nxnative/refs/heads/ascension-1.3-public/dm/mac/ascension-installer/Ascension-Installer.zip), unzip it, and open **Ascension Installer.app**.
+2. Choose your own Switch 2 Ocarina of Time `.nup` containing update `v131072`, then choose an installation folder.
+3. Click **Build & Install**. The app builds locally and appears in the folder you chose. A compatible Ascension install in that folder keeps its saves and preferences.
+
+The installer includes the Ascension build source. Your NUP is the game input and stays on your Mac. An Apple silicon Mac with macOS 26.6 or later, full Xcode with the Metal Toolchain, and [Homebrew](https://brew.sh) tools are required. The first build can take several hours. [Installer setup and source](dm/mac/ascension-installer/README.md).
+
 Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
 
 It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
