@@ -41,7 +41,7 @@ uint64_t dm_guest_frame(void) { return test_frame; }
 static int touch_down, touch_new, touch_downs; static float touch_x, touch_y;
 static void touch_to(const dm_touch *t, int n) { if (n > 0) { touch_new |= !touch_down; touch_downs += !touch_down; touch_x = t[0].x; touch_y = t[0].y; } touch_down = n > 0; }
 void (*_Atomic dm_touch_observer)(const dm_touch *t, int n);
-void dm_touch_set(const dm_touch *t, int n) { touch_to(t, n); void (*o)(const dm_touch *, int) = atomic_load(&dm_touch_observer); if (o) o(t, n); }
+void dm_touch_set(const dm_touch *t, int n) { if (!dm_input_script_only()) touch_to(t, n); void (*o)(const dm_touch *, int) = atomic_load(&dm_touch_observer); if (o) o(t, n); }
 void dm_touch_script(const dm_touch *t, int n) { touch_to(t, n); }
 static int64_t touch_samp; static int touch_points = -1;   // hle_touch.c numbers every sample from 1; the last sample's points argument
 static int touch_stub_n; static uint32_t touch_stub_attr[16];   // handheld samples carry this many fingers (finger i: attributes touch_stub_attr[i], x 100 + i)
@@ -62,6 +62,11 @@ void dm_gfx_texlist(int target) { (void)target; }
 // the guest address space (hle_svc.c): the unit test has none, so every stack is a host stack and the big-stack take-overs (the controller applet) run on it directly (hle_bigstack.c)
 int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }
 void dm_gfx_restop(void) {}
+// DM_CTL diagnostics are linked by hid_keys_init but never exercised by this
+// input-only fixture; match their production signatures without pulling in Metal.
+void dm_gfx_addr_note(uint64_t a, char *note, size_t n) { (void)a; if (n) note[0] = 0; }
+void dm_gfx_bufsnap(const char *key, uint64_t a, size_t n, const char *path) { (void)key; (void)a; (void)n; (void)path; }
+void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; }
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 void dm_ctl_peek(uint64_t a, int n) { (void)a; (void)n; }
 void crash_dump_now(const char *why) { (void)why; }
@@ -70,9 +75,6 @@ void dm_ctl_cvar_i32(uint64_t off, int32_t v) { (void)off; (void)v; }
 void dm_ctl_cvar_f32(uint64_t off, float v) { (void)off; (void)v; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_passdump_next(long n) { (void)n; }
-void dm_gfx_addr_note(uint64_t a, char *note, size_t n) { (void)a; if (n) note[0] = 0; }   // DM_CTL "addr" (nvn_mtl.m)
-void dm_gfx_bufsnap(const char *key, uint64_t a, size_t n, const char *path) { (void)key; (void)a; (void)n; (void)path; }   // DM_CTL "bufsnap" (nvn_mtl.m)
-void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; }   // DM_CTL "atrace" (probe.c)
 static int applet_depth, applet_opens, applet_closes_at_depth0;   // hle_oe.c: the applet stand-ins open and close their applet around the answer
 void dm_applet_enter(const char *name) { (void)name; applet_depth++; applet_opens++; }
 void dm_applet_leave(void) { applet_closes_at_depth0 += --applet_depth == 0; }
@@ -1644,7 +1646,69 @@ static void t_unsupported_style(void) {
     h_hid_SetStyles(0xffffffffu); pthread_mutex_lock(&g_style_lock); g_style_ev[0] = NULL; pthread_mutex_unlock(&g_style_lock);
 }
 
+static void t_script_only(void) {
+    // The configuration is immutable in production. This single-threaded fixture
+    // explicitly reruns its initializer to exercise both process-start policies.
+    unsetenv("DM_INPUT_SCRIPT_ONLY"); script_only_init();
+    CHECK(!dm_input_script_only(), "script isolation is off by default");
+    g_mode = 1; g_styles_supported = 0xffffffffu; dm_joy_attach(0, 0); dm_pad_players(3);
+    ids((uint32_t[]){0, 1, NPAD_HANDHELD}, 3); dm_input_hold(0); atomic_store(&g_sync_on, 0);
+    script_set(0, 0, 0, 0, 0); dm_input_set(DM_BTN_B, 0, 0, 0, 0);
+    dm_pad_set(DM_BTN_LS, DM_STICK_MAX, 0, -DM_STICK_MAX, 0);
+    NpadState s = npad_of(0, STYLE_FULLKEY);
+    CHECK((s.buttons & (DM_BTN_B | DM_BTN_LS)) == (DM_BTN_B | DM_BTN_LS) && s.lx == DM_STICK_MAX, "default physical buttons and axes remain unchanged");
+    setenv("DM_INPUT_SCRIPT_ONLY", "0", 1); script_only_init(); CHECK(!dm_input_script_only(), "explicit 0 leaves normal input enabled");
+    setenv("DM_INPUT_SCRIPT_ONLY", "1", 1); script_only_init(); CHECK(dm_input_script_only(), "explicit 1 enables test isolation");
+
+    char path[512]; snprintf(path, sizeof path, "%s/t_hid_isolated.XXXXXX", getenv("TMPDIR") ?: "/tmp");
+    int fd = mkstemp(path); CHECK(fd >= 0, "isolated recorder fixture path"); if (fd >= 0) close(fd);
+    g_rec_have = 0; g_rec_cur = (rec_state){0}; g_rec_from = 0; test_frame = 100;
+    CHECK(rec_open(path), "record ignored physical input");
+    dm_touch_script(NULL, 0); touch_down = touch_new = 0;
+    dm_touch physical = {0, .75f, .25f}; dm_touch_set(&physical, 1);
+    script_set(DM_BTN_A, 0, 0, 8192, 0);
+    s = npad_of(0, STYLE_FULLKEY);
+    CHECK(s.buttons == DM_BTN_A && s.lx == 0 && s.rx == 8192, "script buttons and exact axis win while full physical input is ignored");
+    CHECK(!touch_down, "physical touch cannot alter scripted touch state");
+    CHECK(dm_cheats_keys() == DM_BTN_A, "physical controls cannot trigger guest cheat conditions");
+    uint64_t peek; int32_t axes[4]; dm_input_peek(&peek, axes);
+    CHECK((peek & (DM_BTN_B | DM_BTN_LS)) == (DM_BTN_B | DM_BTN_LS) && axes[0] == DM_STICK_MAX, "native applet controls still see physical input");
+    dm_pad_set_player(1, DM_BTN_X, 0, DM_STICK_MAX, 0, 0);
+    s = npad_of(1, STYLE_FULLKEY); CHECK(s.attributes && !s.buttons && !s.lx && !s.ly, "other connected player also remains neutral");
+    dm_touch scripted = {0, .25f, .5f}; dm_touch_script(&scripted, 1); dm_touch_set(NULL, 0);
+    CHECK(touch_down && touch_x == .25f && touch_y == .5f, "physical touch release cannot cancel scripted touch");
+    test_frame++; s = npad_of(0, STYLE_FULLKEY); dm_rec_finish();
+    atomic_store(&g_rec_on, 0); atomic_store(&dm_touch_observer, NULL);
+    if (g_rec_file) { fclose(g_rec_file); g_rec_file = NULL; }
+    char *recorded = keys_file(path);
+    CHECK(recorded && strstr(recorded, "B") && strstr(recorded, "LS") && strstr(recorded, "L1.00/0.00") && strstr(recorded, "T0.750x0.250"), "DM_REC truthfully records ignored physical buttons, axes and touch");
+    CHECK(recorded && !strstr(recorded, ":A") && !strstr(recorded, "T0.250x0.500"), "DM_REC still excludes scripted input");
+    free(recorded); unlink(path);
+    script_set(0, 0, 0, 0, 0); s = npad_of(0, STYLE_FULLKEY);
+    CHECK(!s.buttons && !s.lx && !s.rx, "script release leaves no held physical or latched input");
+
+    // Even supported Joy-Con styles must not bypass the isolation read gate.
+    dm_joy_attach(0, 3); dm_joy_set(0, 0, DM_BTN_L | DM_BTN_LSL, DM_STICK_MAX, 0);
+    script_set(DM_BTN_A, 0, 0, 0, 0); s = npad_of(0, STYLE_JOYDUAL);
+    CHECK(s.attributes && s.buttons == DM_BTN_A && !s.lx, "Joy-Con physical path suppressed with scripted button retained");
+    script_set(0, 0, 0, 0, 0); s = npad_of(0, STYLE_JOYDUAL); CHECK(!s.buttons && !s.lx, "Joy-Con release stays neutral");
+    JcmsState mouse[2]; dm_joy_mouse(0, 0, 400, -200, 3);
+    CHECK(jcms_copy(mouse, 2, 0) == 0, "physical Joy-Con mouse samples hidden from guest");
+    NmouseState pointer; memset(&pointer, 0xcc, sizeof pointer);
+    CHECK(!h_hid_NmouseState(&pointer, 0) && !pointer.buttons && !pointer.dx, "physical mouse state is cleared when isolated");
+    float acc[3] = {1, 0, 0}, gyro[3] = {0, 1, 0}; motion_state motion;
+    dm_motion_set(0, acc, gyro); dm_motion_set_joy(0, 0, acc, gyro, motion_now);
+    CHECK(!motion_live(0, &motion) && !motion_joy_pick(0, 0, &motion), "live controller, HID, phone and Joy-Con motion paths are gated");
+    atomic_store(&g_shake_on, 0); atomic_store(&g_shake_end, 0);
+    dm_input_set(DM_BTN_SHAKE, 0, 0, 0, 0); CHECK(!atomic_load(&g_shake_on), "physical Shake ignored");
+    script_set(DM_BTN_SHAKE, 0, 0, 0, 0); CHECK(atomic_load(&g_shake_on), "scripted Shake remains available");
+    script_set(0, 0, 0, 0, 0); dm_input_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0);
+    dm_touch_script(NULL, 0); dm_joy_attach(0, 0); dm_pad_players(1);
+    unsetenv("DM_INPUT_SCRIPT_ONLY"); script_only_init();
+}
+
 int main(void) {
+    unsetenv("DM_INPUT_SCRIPT_ONLY");
     CHECK(setenv("DM_RUMBLE_LOG", "1", 1) == 0, "enable rumble diagnostics");
     setenv("DM_IMU_DELAY", "0", 1);   // the tests of the live history read it at the present; t_live_delay checks the playout delay
     // The plumbing tests (streams, interpolation, dither, pairs) were written with the samples negated: they keep that (DM_IMU_*_SIGN=-1); t_npad_imu_samples and
@@ -1706,6 +1770,7 @@ int main(void) {
         CHECK(pad_slot_take_lowest(&f, &o[DM_PLAYERS], "pad") == -1, "press: none left when every player is held");
         CHECK(pad_slot_take_lowest(&f, NULL, "pad") == -1, "press: no owner, no slot");
     }
+    t_script_only();
     printf("hid players: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

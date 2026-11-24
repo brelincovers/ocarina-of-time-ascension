@@ -8,6 +8,7 @@
 // +0x10 x, +0x14 y, +0x18 diameter x, +0x1c diameter y, +0x20 rotation angle, +0x24 reserved. TouchScreenState<16>: +0 sample number, +8 touch count, 16 TouchState from +0x10.
 #include "dm.h"
 #include "front.h"
+#include "dm_input.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -41,7 +42,7 @@ static void touch_apply(const dm_touch *t, int n) {
 // dm_touch_script, which it does not, so a recording never holds scripted input
 void (*_Atomic dm_touch_observer)(const dm_touch *t, int n);
 void dm_touch_set(const dm_touch *t, int n) {
-    touch_apply(t, n);
+    if (!dm_input_script_only()) touch_apply(t, n);
     void (*o)(const dm_touch *, int) = atomic_load_explicit(&dm_touch_observer, memory_order_relaxed); if (o) o(t, n);
 }
 void dm_touch_script(const dm_touch *t, int n) { touch_apply(t, n); }

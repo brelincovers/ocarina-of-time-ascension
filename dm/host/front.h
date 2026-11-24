@@ -1,6 +1,7 @@
 // Host front end (Mac: front_mac.m; iOS: dm/ios separately implements the same-named interface).
 #pragma once
 #include <stdlib.h>
+#include <stdint.h>
 // Metal reads HUD switches when the first device is made. Called before host preload and again after the launcher applies its settings; explicit environment values win.
 static inline void front_hud_env(void) {
     const char *e = getenv("DM_METAL_HUD");
@@ -13,11 +14,24 @@ static inline void front_hud_env(void) {
 void front_run(void (*guest)(void));
 // The CAMetalLayer the graphics backend presents frames to (NULL when there is no window)
 void *front_metal_layer(void);
+// Whether the Mac front end opened a BT.2020 PQ drawable. Zero on other front ends.
+int front_hdr_active(void);
 // The highest refresh rate of the window's screen in Hz, 0 = not known (Mac front_mac.m; none on iOS, whose screens run at multiples of 60 Hz). Any thread
 int front_screen_max_fps(void);
+// Optional frame-generation observer. Fresh predicted output target and observed
+// target-to-target interval, in CACurrentMediaTime seconds. Zero means unavailable;
+// a prediction is not evidence of presentation. Thread-safe, no drawable ownership.
+int front_framegen_timing(double *next_target, double *refresh_period);
+int front_framegen_timing_epoch(double *next_target, double *refresh_period, uint64_t *epoch);
 // The pixel size of the display the game is shown on: on the Mac the window's screen in its current mode (the main display before the window is up) (a scaled Retina mode's pixels), an iPhone's or iPad's screen (nativeBounds).
 // Returns 0 and leaves w, h alone when not known (no front end: graphics unit tests). Any thread
 int front_display_pixels(int *w, int *h);
+// Mac game's actual unobscured content and Metal drawable, in backing pixels.
+// Unlike front_display_pixels these describe the window, not the display mode.
+// Published on AppKit's main thread; a consistent pair can be read on any thread.
+// Returns 0 before a valid view/drawable exists, leaving the outputs unchanged.
+int front_content_pixels(int *w, int *h);
+int front_drawable_pixels(int *w, int *h);
 // Whether the window's current screen mode supports variable refresh (Mac front_mac.m; none on iOS). Any thread
 int front_screen_variable_refresh(void);
 // The frame rate the display link paces the game at (60, 30, 120; nvn_mtl.m link_sync): in fullscreen, a screen whose refresh rate is not a multiple of it is switched, while the game runs,

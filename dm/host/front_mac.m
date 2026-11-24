@@ -12,14 +12,17 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
+#import <CoreVideo/CoreVideo.h>
 #import <GameController/GameController.h>
 #include "dm.h"
+#include "audio_control.h"
 #include "dm_input.h"
 #include "front.h"
 #include "hle.h"
 #include "pad_slots.h"
 #include "haptics_apple.h"
 #include "motion_apple.h"
+#include "fps_activity.h"
 #include "motion_pro_mac.h"
 #include "pad_jc1_mac.h"
 #include "pad_apple.h"
@@ -33,10 +36,33 @@ static void merge_rumble_to(void (*sink)(const dm_haptic_state *));
 #include "home_quit_mac.h"
 #include "ctrl_prompt.h"
 #include <signal.h>
+#include <stdatomic.h>
 #include <math.h>
 #include <sys/stat.h>
 
 static CAMetalLayer *g_layer;
+static _Atomic int g_hdr_active;
+int front_hdr_active(void) { return g_hdr_active; }
+
+static void update_display_range(NSScreen *screen) {
+    if (!screen || !g_layer) return;
+    const char *hdr = getenv("DM_EXPERIMENTAL_HDR");
+    BOOL wantsHDR = hdr && atoi(hdr) && dm_opmode() == 1 &&
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0;
+    MTLPixelFormat desired = wantsHDR ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
+    static BOOL configured;
+    if (configured && g_layer.pixelFormat == desired) return;
+    CGColorSpaceRef pq = wantsHDR ? CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ) : NULL;
+    wantsHDR = pq != NULL;
+    g_layer.colorspace = pq;
+    g_layer.wantsExtendedDynamicRangeContent = wantsHDR;
+    g_layer.pixelFormat = wantsHDR ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm;
+    if (pq) CGColorSpaceRelease(pq);
+    g_hdr_active = wantsHDR;
+    configured = YES;
+    LOG("front end: display output %s (%s)", wantsHDR ? "HDR" : "SDR", screen.localizedName.UTF8String);
+}
+
 static uint64_t g_btn;
 static int g_w, g_a, g_s, g_d;
 static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
@@ -46,6 +72,133 @@ void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
 int front_screen_max_fps(void) { return g_screen_fps; }
 static _Atomic CGDirectDisplayID g_screen_id;   // the window's screen (screen_refresh); 0 until the window is up, then the main display stands in
+
+// Frame generation observes the window display without acquiring drawables or changing
+// the present path. CoreVideo's output host timestamps predict display opportunities;
+// only Metal drawable callbacks establish that a picture was actually displayed.
+// Keep this observer off for ordinary rendering. In particular maximumFramesPerSecond
+// is a capability, not a deadline (a ProMotion display may run below its maximum).
+static pthread_mutex_t g_fg_display_lifetime = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_fg_display_sample = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic(CVDisplayLinkRef) g_fg_display_link;
+static CGDirectDisplayID g_fg_display_id;   // under lifetime lock
+static double g_fg_display_target, g_fg_display_period, g_fg_display_sample_time;
+static uint64_t g_fg_display_previous_host;   // under sample lock
+static uint64_t g_fg_display_epoch = 1;       // under sample lock; never zero
+static void fg_display_new_epoch(void) { if (!++g_fg_display_epoch) ++g_fg_display_epoch; }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static CVReturn fg_display_tick(CVDisplayLinkRef link, const CVTimeStamp *now,
+                               const CVTimeStamp *output, CVOptionFlags in_flags,
+                               CVOptionFlags *out_flags, void *context) {
+    (void)now; (void)in_flags; (void)out_flags; (void)context;
+    if (!output || !(output->flags & kCVTimeStampHostTimeValid) ||
+        !output->hostTime || link != atomic_load(&g_fg_display_link)) return kCVReturnSuccess;
+    double frequency = CVGetHostClockFrequency();
+    if (!(frequency > 0)) return kCVReturnSuccess;
+    // Anchor to the clock used by presentedTime and the scheduler. Subtract host ticks
+    // as floating point to avoid unsigned underflow when a callback is delivered late.
+    uint64_t host_now = CVGetCurrentHostTime();
+    double sample_time = CACurrentMediaTime();
+    double target = sample_time + ((double)output->hostTime - (double)host_now) / frequency;
+    pthread_mutex_lock(&g_fg_display_sample);
+    if (link == atomic_load(&g_fg_display_link)) {
+        double period = output->hostTime > g_fg_display_previous_host && g_fg_display_previous_host ?
+            (output->hostTime - g_fg_display_previous_host) / frequency : 0;
+        g_fg_display_previous_host = output->hostTime;
+        // Require two successive target timestamps; never manufacture a period from
+        // the panel's advertised maximum. A skipped/late callback makes this sample
+        // unavailable until cadence is observed again.
+        if (period >= 1.0 / 360.0 && period <= 1.0 / 20.0 &&
+            target > sample_time && target - sample_time <= 2 * period) {
+            if (g_fg_display_period > 0 && fabs(period-g_fg_display_period) > 0.0005) fg_display_new_epoch();
+            g_fg_display_target = target;
+            g_fg_display_period = period;
+            g_fg_display_sample_time = sample_time;
+        } else {
+            if (g_fg_display_period > 0) fg_display_new_epoch();
+            g_fg_display_target = g_fg_display_period = g_fg_display_sample_time = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_fg_display_sample);
+    return kCVReturnSuccess;
+}
+
+int front_framegen_timing_epoch(double *next_target, double *refresh_period, uint64_t *epoch) {
+    if (!next_target || !refresh_period || !epoch) return 0;
+    *next_target = *refresh_period = 0;
+    *epoch = 0;
+    pthread_mutex_lock(&g_fg_display_sample);
+    double target = g_fg_display_target, period = g_fg_display_period;
+    double sampled = g_fg_display_sample_time;
+    int active = atomic_load(&g_fg_display_link) != NULL;
+    uint64_t observed_epoch = g_fg_display_epoch;
+    pthread_mutex_unlock(&g_fg_display_sample);
+    double now = CACurrentMediaTime();
+    if (!active || !(period > 0) || !(sampled > 0) || now < sampled ||
+        now - sampled > 2 * period || target <= now || target - now > 2 * period) return 0;
+    *next_target = target;
+    *refresh_period = period;
+    *epoch = observed_epoch;
+    return 1;
+}
+int front_framegen_timing(double *next_target, double *refresh_period) {
+    uint64_t epoch; return front_framegen_timing_epoch(next_target, refresh_period, &epoch);
+}
+
+static void fg_display_stop_locked(void) {
+    CVDisplayLinkRef link = atomic_exchange(&g_fg_display_link, NULL);
+    if (link) { CVDisplayLinkStop(link); CVDisplayLinkRelease(link); }
+    g_fg_display_id = 0;
+    pthread_mutex_lock(&g_fg_display_sample);
+    fg_display_new_epoch();
+    g_fg_display_target = g_fg_display_period = g_fg_display_sample_time = 0;
+    g_fg_display_previous_host = 0;
+    pthread_mutex_unlock(&g_fg_display_sample);
+}
+static void fg_display_shutdown(void) {
+    pthread_mutex_lock(&g_fg_display_lifetime);
+    fg_display_stop_locked();
+    pthread_mutex_unlock(&g_fg_display_lifetime);
+}
+static void fg_display_sync(CGDirectDisplayID display) {   // main thread
+    const char *requested = getenv("DM_FRAMEGEN");
+    if (!requested || atoi(requested) <= 0) return;
+    static int registered;
+    if (!registered) { atexit(fg_display_shutdown); registered = 1; }
+    pthread_mutex_lock(&g_fg_display_lifetime);
+    if (display == g_fg_display_id && atomic_load(&g_fg_display_link)) {
+        // A same-display notification can be a refresh-mode change. Require new
+        // targets before admission rather than serving a prediction from the old mode.
+        pthread_mutex_lock(&g_fg_display_sample);
+        fg_display_new_epoch();
+        g_fg_display_target = g_fg_display_period = g_fg_display_sample_time = 0;
+        g_fg_display_previous_host = 0;
+        pthread_mutex_unlock(&g_fg_display_sample);
+        pthread_mutex_unlock(&g_fg_display_lifetime);
+        return;
+    }
+    fg_display_stop_locked();
+    CVDisplayLinkRef link = NULL;
+    CVReturn status = display ? CVDisplayLinkCreateWithCGDisplay(display, &link) : kCVReturnInvalidDisplay;
+    if (status == kCVReturnSuccess) status = CVDisplayLinkSetOutputCallback(link, fg_display_tick, NULL);
+    if (status == kCVReturnSuccess) {
+        atomic_store(&g_fg_display_link, link);
+        status = CVDisplayLinkStart(link);
+    }
+    if (status == kCVReturnSuccess) {
+        g_fg_display_id = display;
+        LOG("frame generation: observing display %u output timestamps", display);
+    } else {
+        atomic_store(&g_fg_display_link, NULL);
+        if (link) CVDisplayLinkRelease(link);
+        LOG("frame generation: display timing unavailable (%d); ordinary rendering remains available", status);
+    }
+    pthread_mutex_unlock(&g_fg_display_lifetime);
+}
+#pragma clang diagnostic pop
+
 int front_display_pixels(int *w, int *h) {
     CGDirectDisplayID id = g_screen_id; CGDisplayModeRef m = CGDisplayCopyDisplayMode(id ? id : CGMainDisplayID()); if (!m) return 0;
     int a = (int)CGDisplayModeGetPixelWidth(m), b = (int)CGDisplayModeGetPixelHeight(m); CGDisplayModeRelease(m);
@@ -59,6 +212,7 @@ static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabil
     g_screen_fps = (int)screen.maximumFramesPerSecond;
     g_screen_id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
     g_screen_variable_refresh = screen.minimumRefreshInterval > 0 && screen.maximumRefreshInterval > screen.minimumRefreshInterval;
+    fg_display_sync(g_screen_id);
 }
 static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it has entered and when it has left)
 // The software keyboard input box is up (front_text_input). The game window is not key then, which is not a focus change the game should see: on hardware the inline keyboard is drawn inside
@@ -669,9 +823,66 @@ static void pads_start(void) {
 // not a window-wide event monitor, so clicks on the title bar, the window buttons and the resize edges still reach AppKit.
 // The picture's width / height (front.h front_picture_shape; 16:9 until the first present), which the present fits into the view
 static _Atomic double g_picture_aspect = 16.0 / 9.0;
-void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = (double)w / h; }
+static _Atomic uint64_t g_picture_pixels, g_content_pixels, g_drawable_pixels;
+static NSView *g_game_view; // safe-area child when matching; keyboard/Web focus returns here
+static BOOL g_aspect_match, g_aspect_started; // requested policy, not the numeric launch resolution; main thread only
+static double g_aspect_launch_ratio;
+static NSString *g_aspect_fallback;
+extern int dm_screen_aspect_supported(void);
+static uint64_t front_pack_pixels(int w, int h) { return (uint64_t)(uint32_t)w | (uint64_t)(uint32_t)h << 32; }
+static int front_unpack_pixels(uint64_t value, int *w, int *h) {
+    if (!(uint32_t)value || !(uint32_t)(value >> 32)) return 0;
+    *w = (int)(uint32_t)value; *h = (int)(uint32_t)(value >> 32); return 1;
+}
+int front_content_pixels(int *w, int *h) { return front_unpack_pixels(atomic_load(&g_content_pixels), w, h); }
+int front_drawable_pixels(int *w, int *h) { return front_unpack_pixels(atomic_load(&g_drawable_pixels), w, h); }
+void front_picture_shape(int w, int h) {
+    if (w > 0 && h > 0) { g_picture_aspect = (double)w / h; atomic_store(&g_picture_pixels, front_pack_pixels(w, h)); }
+}
+// Resolve only after AppKit has laid out the actual game view. The guest's render
+// targets are configured at startup; resizing must not rewrite them underneath it.
+static void front_resolve_aspect(void) {
+    int w = 0, h = 0;
+    g_aspect_started = YES;
+    if (!g_aspect_match) return;
+    BOOL known = front_content_pixels(&w, &h);
+    double ratio = known ? (double)w / h : 0;
+    g_aspect_launch_ratio = ratio;
+    if (dm_screen_aspect_supported() && ratio >= 1.3 && ratio < 1.77) {
+        char value[32]; snprintf(value, sizeof value, "%.9f", ratio);
+        setenv("DM_SCREEN_ASPECT", value, 1);
+        LOG("front end: aspect Match Display / Window: usable %dx%d, requested %.6f:1 (guest target rounding applies)", w, h, ratio);
+    } else {
+        setenv("DM_SCREEN_ASPECT", "0", 1);
+        g_aspect_fallback = !dm_screen_aspect_supported() ? @"This game build has no verified aspect support; using Original 16:9" :
+            !known ? @"Usable game view unavailable; using Original 16:9" :
+            fabs(ratio - 16.0 / 9.0) < 0.01 ? @"This view uses Original 16:9" :
+            @"This window shape is not supported; using Original 16:9";
+        LOG("front end: aspect Match Display / Window: %s (usable %dx%d)", g_aspect_fallback.UTF8String, w, h);
+    }
+    extern void dm_screen_aspect_apply(void);
+    dm_screen_aspect_apply();
+}
+static BOOL g_hud_available, g_hud_visible;
+
+static void set_performance_hud(BOOL visible) {
+    g_hud_visible = visible;
+    g_layer.developerHUDProperties = @{@"mode": visible ? @"default" : @"disabled"};
+    LOG("front end: Metal performance HUD %s", visible ? "shown" : "hidden");
+}
+
 @interface DmGameView : NSView @end
 @implementation DmGameView
+- (void)togglePerformanceHUD:(NSMenuItem *)item {
+    set_performance_hud(!g_hud_visible);
+    item.state = g_hud_visible ? NSControlStateValueOn : NSControlStateValueOff;
+}
+- (void)selectConsoleMode:(NSMenuItem *)item {
+    dm_set_opmode((int)item.tag);
+    update_display_range(self.window.screen);
+    for (NSMenuItem *mode in item.menu.itemArray)
+        mode.state = mode.tag == dm_opmode() ? NSControlStateValueOn : NSControlStateValueOff;
+}
 - (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
 - (void)mouseDragged:(NSEvent *)e {
     if (!g_input_on) return;
@@ -689,11 +900,17 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
 - (void)fitDrawable {
     CAMetalLayer *l = (CAMetalLayer *)self.layer; if (![l isKindOfClass:CAMetalLayer.class] || !self.window) return;
     l.contentsScale = self.window.backingScaleFactor;
-    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1 || CGSizeEqualToSize(l.drawableSize, px)) return;
-    l.drawableSize = px; LOG("front end: drawable %.0fx%.0f", px.width, px.height);
+    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1) return;
+    uint64_t value = front_pack_pixels((int)llround(px.width), (int)llround(px.height));
+    atomic_store(&g_content_pixels, value);
+    atomic_store(&g_drawable_pixels, value);
+    if (!CGSizeEqualToSize(l.drawableSize, px)) {
+        l.drawableSize = px; LOG("front end: drawable %.0fx%.0f (usable game view)", px.width, px.height);
+    }
 }
 - (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self fitDrawable]; }
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
+- (void)layout { [super layout]; [self fitDrawable]; }
 @end
 
 // AppKit reports a refused fullscreen request only to the window delegate (there is no notification for it)
@@ -710,8 +927,19 @@ static void *guest_tramp(void *p) {
     ((guest_arg *)p)->fn(); LOG("guest thread finished"); exit(0);
 }
 
-// Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
-__attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
+// Metal reads MTL_HUD_ENABLED at its first device. Initialize it for the window's live menu even when the launcher starts with the overlay hidden.
+__attribute__((constructor)) static void hud_env(void) {
+    front_hud_env();
+    if (!getenv("DM_WINDOW")) return;
+    const char *enabled = getenv("MTL_HUD_ENABLED");
+    g_hud_visible = enabled && atoi(enabled) != 0;
+    if (enabled && !g_hud_visible) return;   // An explicit Metal HUD disable still wins.
+    g_hud_available = setenv("MTL_HUD_ENABLED", "1", 0) == 0;
+    if (g_hud_available) {
+        setenv("MTL_HUD_HIDE_METALFX_METRICS", "1", 0);
+        setenv("MTL_HUD_DISABLE_MENU_BAR", "1", 0);   // The Window menu owns the layer's visibility.
+    }
+}
 
 // ---------- Cheats: the menu and the panel (hle_cheats.c holds every state; these only show it and call it) ----------
 
@@ -926,6 +1154,552 @@ static DmCheatsPanel *g_cheats_panel;   // created on the first Show Cheats Wind
 }
 @end
 static DmCheatsMenuDelegate *g_cheats_menu;   // NSMenu keeps its delegate unretained
+
+// Audio menu: the hardware truth comes from dm_audio_get_snapshot(), not from
+// the user's requested mode. AudioUnit transitions are handled by the watchdog.
+// The status is updated from the live output each time the menu opens.
+static BOOL dmPreferenceLocked(const char *key) {
+    for (unsigned i = 0; i < 2; i++) {
+        const char *value = getenv(i ? "DM_ENV_FILE_KEYS" : "DM_ENV_LAUNCH_KEYS");
+        if (value && [[@(value) componentsSeparatedByString:@" "] containsObject:@(key)]) return YES;
+    }
+    return NO;
+}
+
+static void dmRememberFullscreen(BOOL fullscreen) {
+    if (![NSBundle.mainBundle.bundleIdentifier hasPrefix:@"org.nxnative.oot.ascension.framegen"] ||
+        dmPreferenceLocked("DM_FULLSCREEN")) return;
+    [NSUserDefaults.standardUserDefaults setObject:fullscreen ? @"1" : @"0" forKey:@"launcher.DM_FULLSCREEN"];
+}
+
+extern const char *mtl_framegen_status(void);
+static NSString *const kDmAudioPrefKey = @"DMSpatialAudioRouteV2";
+static NSString *const kDmSpeakerPrefKey = @"DMSpeakerOutputPreference";
+enum { DM_SOUND_SPATIAL_OFF = -1 };
+
+static NSString *dmAudioSourceLabel(dm_audio_snapshot s) {
+    if (!s.output_open || !s.source_channels) return @"Awaiting audio";
+    if (s.source_channels == 6) return @"5.1 PCM · 48 kHz · L / R / C / LFE / Ls / Rs";
+    return [NSString stringWithFormat:@"%u-channel PCM · 48 kHz", s.source_channels];
+}
+
+static NSString *dmAudioEffectiveMode(dm_audio_snapshot s) {
+    if (!s.playing || !s.effective_channels) return @"Awaiting audio";
+    if (s.effective_channels == 6) return @"Discrete 5.1 PCM";
+    if (s.apple_spatial_active) {
+        if (s.apple_speaker_renderer) return @"Built-in Speakers — Fixed";
+        return s.head_tracking_configured ? @"Headphones — Head Tracked" : @"Headphones — Fixed";
+    }
+    if (s.binaural_active) return @"Headphones — Fixed (Binaural)";
+    return s.source_channels == 6 && s.effective_channels == 2 ?
+        @"Spatial Audio Off — Stereo Downmix" : @"Spatial Audio Off";
+}
+
+static NSString *dmAudioRequestedMode(dm_audio_snapshot s) {
+    switch (s.preference) {
+        case DM_AUDIO_MODE_AUTO: return @"Automatic";
+        case DM_AUDIO_MODE_STEREO: return @"Stereo";
+        case DM_AUDIO_MODE_SURROUND: return @"5.1 Surround";
+        case DM_AUDIO_MODE_BINAURAL: return @"Binaural";
+        case DM_AUDIO_MODE_APPLE_SPATIAL: return @"Fixed";
+        case DM_AUDIO_MODE_HEAD_TRACKED: return @"Head Tracked";
+    }
+    return @"Unknown";
+}
+
+static NSString *dmAudioFallbackLabel(dm_audio_snapshot s) {
+    if (s.preference == DM_AUDIO_MODE_HEAD_TRACKED && s.playing && !s.head_tracking_configured)
+        return s.head_tracking_available ? @"Head tracking is inactive on the current route" :
+            @"The selected output does not support verified head tracking";
+    switch (s.fallback_reason) {
+        case DM_AUDIO_FALLBACK_OUTPUT_UNAVAILABLE: return @"Output device unavailable";
+        case DM_AUDIO_FALLBACK_DEVICE_CHANNELS:
+            return s.preference == DM_AUDIO_MODE_SURROUND ? @"Output does not expose six channels" : nil;
+        case DM_AUDIO_FALLBACK_UNVERIFIED_LAYOUT: return @"Output speaker layout does not match discrete 5.1";
+        case DM_AUDIO_FALLBACK_SURROUND_SETUP_FAILED: return @"The output rejected discrete 5.1 setup";
+        case DM_AUDIO_FALLBACK_VIRTUALIZER_INACTIVE: return @"Fixed binaural rendering is unavailable on this output";
+        case DM_AUDIO_FALLBACK_APPLE_MIXER_UNAVAILABLE: return @"Apple SpatialMixer unavailable on this route";
+        default: return nil;
+    }
+}
+
+static NSString *dmAudioOutputLabel(dm_audio_snapshot s) {
+    if (s.fallback_reason == DM_AUDIO_FALLBACK_OUTPUT_UNAVAILABLE) return @"Unavailable";
+    if (!s.playing || !s.effective_channels) return @"Awaiting output";
+    NSString *channels = s.effective_channels == 6 ? @"5.1 Surround" :
+        s.effective_channels == 2 ? @"Stereo" : [NSString stringWithFormat:@"%u Channels", s.effective_channels];
+    return s.device_sample_rate > 0 ?
+        [NSString stringWithFormat:@"%@ · PCM · %.1f kHz", channels, s.device_sample_rate / 1000.0] : channels;
+}
+
+@interface DmAudioMenuDelegate : NSObject <NSMenuDelegate>
+@end
+@implementation DmAudioMenuDelegate
+- (void)chooseMode:(NSMenuItem *)item {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSInteger selection = item.tag;
+    if (selection == DM_SOUND_SPATIAL_OFF) {
+        selection = [defaults integerForKey:kDmSpeakerPrefKey];
+        if (selection < DM_AUDIO_MODE_AUTO || selection > DM_AUDIO_MODE_SURROUND)
+            selection = DM_AUDIO_MODE_AUTO;
+    } else if (selection <= DM_AUDIO_MODE_SURROUND) {
+        [defaults setInteger:selection forKey:kDmSpeakerPrefKey];
+    } else {
+        dm_audio_mode current = dm_audio_mode_get();
+        if (current <= DM_AUDIO_MODE_SURROUND)
+            [defaults setInteger:current forKey:kDmSpeakerPrefKey];
+    }
+    dm_audio_mode_set((dm_audio_mode)selection);
+    [defaults setInteger:selection forKey:kDmAudioPrefKey];
+}
+
+- (NSMenuItem *)addChoice:(NSString *)title toMenu:(NSMenu *)menu
+                    mode:(NSInteger)mode selected:(BOOL)selected {
+    NSMenuItem *item = [menu addItemWithTitle:title action:@selector(chooseMode:) keyEquivalent:@""];
+    item.target = self;
+    item.tag = mode;
+    item.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
+    return item;
+}
+
+- (void)openSoundSettings:(NSMenuItem *)item {
+    (void)item;
+    [NSWorkspace.sharedWorkspace openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.Sound-Settings.extension"]];
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [menu removeAllItems];
+    dm_audio_snapshot s;
+    dm_audio_get_snapshot(&s);
+    BOOL spatial = s.preference >= DM_AUDIO_MODE_BINAURAL;
+    NSString *device = s.device_name[0] ? ([NSString stringWithUTF8String:s.device_name] ?: @"Unknown device") :
+        @"System Default";
+    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Output"]];
+
+    NSString *status = dmAudioOutputLabel(s);
+    NSMenuItem *output = [[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"%@, %@", device, status]
+                                                   action:nil keyEquivalent:@""];
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 320, 60)];
+    NSGlassEffectView *glass = [[NSGlassEffectView alloc] initWithFrame:NSInsetRect(container.bounds, 10, 4)];
+    glass.cornerRadius = 15;
+    NSView *content = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 52)];
+    NSTextField *name = [NSTextField labelWithString:device];
+    name.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    name.lineBreakMode = NSLineBreakByTruncatingTail;
+    name.frame = NSMakeRect(12, 27, 276, 17);
+    NSTextField *format = [NSTextField labelWithString:status];
+    format.font = [NSFont systemFontOfSize:11];
+    format.textColor = NSColor.secondaryLabelColor;
+    format.lineBreakMode = NSLineBreakByTruncatingTail;
+    format.frame = NSMakeRect(12, 9, 276, 15);
+    [content addSubview:name];
+    [content addSubview:format];
+    glass.contentView = content;
+    [container addSubview:glass];
+    output.view = container;
+    [menu addItem:output];
+    [menu addItemWithTitle:dmAudioEffectiveMode(s) action:nil keyEquivalent:@""].enabled = NO;
+    [menu addItemWithTitle:[@"Game source: " stringByAppendingString:dmAudioSourceLabel(s)]
+                    action:nil keyEquivalent:@""].enabled = NO;
+
+    [menu addItem:NSMenuItem.separatorItem];
+    [menu addItem:[NSMenuItem sectionHeaderWithTitle:@"Spatial Audio"]];
+    [self addChoice:@"Off" toMenu:menu mode:DM_SOUND_SPATIAL_OFF selected:!spatial];
+    NSMenuItem *fixed = [self addChoice:@"Fixed" toMenu:menu mode:DM_AUDIO_MODE_APPLE_SPATIAL
+                              selected:s.preference == DM_AUDIO_MODE_APPLE_SPATIAL];
+    fixed.enabled = !s.output_open || s.source_channels == 6;
+    NSMenuItem *tracked = [self addChoice:@"Head Tracked" toMenu:menu mode:DM_AUDIO_MODE_HEAD_TRACKED
+                                selected:s.preference == DM_AUDIO_MODE_HEAD_TRACKED];
+    tracked.enabled = s.head_tracking_available && (!s.output_open || s.source_channels == 6);
+    [self addChoice:@"Binaural" toMenu:menu mode:DM_AUDIO_MODE_BINAURAL
+           selected:s.preference == DM_AUDIO_MODE_BINAURAL].enabled = fixed.enabled && !s.built_in_speakers;
+    if (s.personalized_active)
+        [menu addItemWithTitle:@"Personalized Spatial Audio" action:nil keyEquivalent:@""].enabled = NO;
+    NSString *fallback = dmAudioFallbackLabel(s);
+    if (fallback)
+        [menu addItemWithTitle:fallback action:nil keyEquivalent:@""].enabled = NO;
+
+    [menu addItem:NSMenuItem.separatorItem];
+    NSInteger speakerMode = spatial ? [NSUserDefaults.standardUserDefaults integerForKey:kDmSpeakerPrefKey] : s.preference;
+    NSMenu *formatMenu = [[NSMenu alloc] initWithTitle:@"Speaker Output"];
+    formatMenu.autoenablesItems = NO;
+    [self addChoice:@"Automatic" toMenu:formatMenu mode:DM_AUDIO_MODE_AUTO selected:speakerMode == DM_AUDIO_MODE_AUTO];
+    [self addChoice:@"Stereo" toMenu:formatMenu mode:DM_AUDIO_MODE_STEREO selected:speakerMode == DM_AUDIO_MODE_STEREO];
+    [self addChoice:@"5.1 Surround" toMenu:formatMenu mode:DM_AUDIO_MODE_SURROUND
+           selected:speakerMode == DM_AUDIO_MODE_SURROUND].enabled = s.surround_layout_valid;
+    if (spatial)
+        [formatMenu addItemWithTitle:@"Selecting an output turns Spatial Audio off" action:nil keyEquivalent:@""].enabled = NO;
+    [menu addItemWithTitle:@"Speaker Output" action:nil keyEquivalent:@""].submenu = formatMenu;
+    NSMenuItem *settings = [menu addItemWithTitle:@"Sound Settings…" action:@selector(openSoundSettings:) keyEquivalent:@""];
+    settings.target = self;
+}
+@end
+static DmAudioMenuDelegate *g_audio_menu;   // held strongly; NSMenu.delegate is unretained
+
+extern uint64_t mtl_generated_frame_count(void);
+
+@interface DmPictureMenuDelegate : NSObject <NSMenuDelegate>
+@end
+
+extern uint64_t mtl_up_game_stats(int *last_scaler);
+
+@implementation DmPictureMenuDelegate
+- (void)chooseSetting:(NSMenuItem *)item {
+    NSArray<NSString *> *choice = item.representedObject;
+    NSString *key = choice[0];
+    if (dmPreferenceLocked(key.UTF8String)) return;
+    if ([key isEqualToString:@"DM_SCREEN_ASPECT"] && [choice[1] isEqualToString:@"auto"] &&
+        !dm_screen_aspect_supported()) return;
+    [NSUserDefaults.standardUserDefaults setObject:choice[1] forKey:[@"launcher." stringByAppendingString:key]];
+}
+- (NSMenu *)addSetting:(NSString *)key title:(NSString *)title toMenu:(NSMenu *)menu
+               choices:(NSArray<NSArray<NSString *> *> *)choices {
+    BOOL locked = dmPreferenceLocked(key.UTF8String);
+    NSString *prefKey = [@"launcher." stringByAppendingString:key];
+    NSString *requested = locked ? nil : [NSUserDefaults.standardUserDefaults stringForKey:prefKey];
+    const char *active = getenv(key.UTF8String);
+    if (!requested) requested = active ? @(active) : choices.firstObject[0];
+
+    NSMenu *setting = [[NSMenu alloc] initWithTitle:title];
+    setting.autoenablesItems = NO;
+    for (NSArray<NSString *> *choice in choices) {
+        NSMenuItem *item = [setting addItemWithTitle:[choice[1] stringByAppendingString:@" (next launch)"]
+                                             action:@selector(chooseSetting:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = @[key, choice[0]];
+        item.state = [requested isEqualToString:choice[0]] ? NSControlStateValueOn : NSControlStateValueOff;
+        BOOL unsupportedAspect = [key isEqualToString:@"DM_SCREEN_ASPECT"] && [choice[0] isEqualToString:@"auto"] &&
+                                 !dm_screen_aspect_supported();
+        item.enabled = !locked && !unsupportedAspect;
+    }
+    if (locked) [setting addItemWithTitle:@"Set by a launch override" action:nil keyEquivalent:@""].enabled = NO;
+    [menu addItemWithTitle:title action:nil keyEquivalent:@""].submenu = setting;
+    return setting;
+}
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [menu removeAllItems];
+
+    NSMenu *hdr = [self addSetting:@"DM_EXPERIMENTAL_HDR" title:@"HDR Output" toMenu:menu
+                           choices:@[@[@"1", @"On"], @[@"0", @"Off"]]];
+    [hdr addItemWithTitle:front_hdr_active() ? @"Active: HDR" : @"Active: SDR" action:nil keyEquivalent:@""].enabled = NO;
+    [hdr addItemWithTitle:@"HDR requires Docked mode and an HDR-capable display" action:nil keyEquivalent:@""].enabled = NO;
+
+    NSMenu *aspect = [self addSetting:@"DM_SCREEN_ASPECT" title:@"Aspect Ratio" toMenu:menu
+                              choices:@[@[@"0", @"Original 16:9"], @[@"auto", @"Match Display / Window"]]];
+    if (!dm_screen_aspect_supported())
+        [aspect addItemWithTitle:@"Matching requires a verified game-build patch" action:nil keyEquivalent:@""].enabled = NO;
+
+    NSMenu *quality = [self addSetting:@"DM_GFX_SCALE" title:@"Graphics Quality" toMenu:menu
+                               choices:@[@[@"0", @"Quality"], @[@"1", @"Performance"]]];
+    const char *scale = getenv("DM_GFX_SCALE");
+    int tier = scale ? atoi(scale) : 0;
+    NSString *qualityStatus = tier == 1 ? @"Active: Performance" : tier == 2 ? @"Active: Tier 2 override" : @"Active: Quality";
+    [quality addItemWithTitle:qualityStatus action:nil keyEquivalent:@""].enabled = NO;
+
+    NSMenu *scaler = [self addSetting:@"DM_UPSCALER" title:@"Scene Reconstruction" toMenu:menu
+                             choices:@[@[@"game", @"Original NDSR"], @[@"metalfx", @"MetalFX Spatial"]]];
+    int lastScaler = 0;
+    mtl_up_game_stats(&lastScaler);
+    NSString *scalerStatus = lastScaler == 2 ? @"Last observed: MetalFX Spatial" :
+                             lastScaler == 1 ? @"Last observed: Original NDSR" : @"Awaiting a recognized scene pass";
+    [scaler addItemWithTitle:scalerStatus action:nil keyEquivalent:@""].enabled = NO;
+
+    if ([NSBundle.mainBundle.bundleIdentifier hasPrefix:@"org.nxnative.oot.ascension.framegen"])
+        [self addSetting:@"DM_FRAMEGEN" title:@"Frame Generation (Experimental)" toMenu:menu
+                 choices:@[@[@"0", @"Off"], @[@"1", @"On"]]];
+}
+@end
+
+static DmPictureMenuDelegate *g_picture_menu;
+
+// A stored choice describes the next launch; effective geometry comes only from
+// the actual presentation path. Changing a window never silently stretches it.
+static NSArray<NSString *> *dmAspectDiagnostics(void) {
+    int cw = 0, ch = 0, dw = 0, dh = 0, pw = 0, ph = 0;
+    front_content_pixels(&cw, &ch); front_drawable_pixels(&dw, &dh);
+    BOOL picture = front_unpack_pixels(atomic_load(&g_picture_pixels), &pw, &ph);
+    NSString *effective = picture ? [NSString stringWithFormat:@"Effective picture: %d × %d (%.3f:1)", pw, ph, (double)pw / ph] : @"Effective picture: awaiting the game’s first picture";
+    NSMutableArray<NSString *> *rows = [NSMutableArray arrayWithArray:@[
+        g_aspect_match ? @"Launch aspect: Match Display / Window" : @"Launch aspect: Original 16:9",
+        effective,
+        cw && ch ? [NSString stringWithFormat:@"Usable game view: %d × %d pixels", cw, ch] : @"Usable game view: unavailable",
+        dw && dh ? [NSString stringWithFormat:@"Metal drawable: %d × %d pixels", dw, dh] : @"Metal drawable: unavailable"
+    ]];
+    if (g_aspect_fallback) [rows addObject:g_aspect_fallback];
+    if (g_aspect_match && g_aspect_started && cw > 0 && ch > 0 && g_aspect_launch_ratio > 0 &&
+        fabs(((double)cw / ch) / g_aspect_launch_ratio - 1) > 0.001)
+        [rows addObject:@"Window shape changed — relaunch to match; current picture remains proportional"];
+    return rows;
+}
+
+@interface DmDisplayMenuDelegate : NSObject <NSMenuDelegate> @end
+@implementation DmDisplayMenuDelegate
+- (void)chooseAspect:(NSMenuItem *)item {
+    if (dmPreferenceLocked("DM_SCREEN_ASPECT")) return;
+    if (item.tag && !dm_screen_aspect_supported()) return;
+    [NSUserDefaults.standardUserDefaults setObject:item.tag ? @"auto" : @"0" forKey:@"launcher.DM_SCREEN_ASPECT"];
+}
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [menu removeAllItems];
+    NSMenu *aspect = [[NSMenu alloc] initWithTitle:@"Aspect Ratio"];
+    aspect.autoenablesItems = NO;
+    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"launcher.DM_SCREEN_ASPECT"];
+    BOOL requested = dmPreferenceLocked("DM_SCREEN_ASPECT") || !saved ? g_aspect_match : [saved isEqual:@"auto"];
+    for (NSInteger mode = 0; mode <= 1; mode++) {
+        NSMenuItem *item = [aspect addItemWithTitle:mode ? @"Match Display / Window (next launch)" : @"Original 16:9 (next launch)"
+                                               action:@selector(chooseAspect:) keyEquivalent:@""];
+        item.target = self; item.tag = mode; item.state = requested == mode ? NSControlStateValueOn : NSControlStateValueOff;
+        item.enabled = !dmPreferenceLocked("DM_SCREEN_ASPECT") && (!mode || dm_screen_aspect_supported());
+    }
+    if (!dm_screen_aspect_supported()) [aspect addItemWithTitle:@"Matching requires a verified game-build patch" action:nil keyEquivalent:@""].enabled = NO;
+    if (dmPreferenceLocked("DM_SCREEN_ASPECT")) [aspect addItemWithTitle:@"Aspect ratio is set by a launch override" action:nil keyEquivalent:@""].enabled = NO;
+    [[menu addItemWithTitle:@"Aspect Ratio" action:nil keyEquivalent:@""] setSubmenu:aspect];
+    [menu addItem:NSMenuItem.separatorItem];
+    for (NSString *row in dmAspectDiagnostics()) [menu addItemWithTitle:row action:nil keyEquivalent:@""].enabled = NO;
+}
+@end
+static DmDisplayMenuDelegate *g_display_menu;
+
+extern void mtl_up_mfx_stats(uint64_t *encoded, uint64_t *kept);
+extern const char *mtl_up_mfx_fallback(void);
+
+static NSArray<NSString *> *dmFPSDiagnostics(void);
+
+@interface DmScalingDiagnostics : NSObject <NSMenuDelegate>
+@end
+
+@implementation DmScalingDiagnostics {
+    NSTimer *_refreshTimer;
+}
+- (void)refreshRows:(NSMenu *)menu {
+    const char *mode = getenv("DM_UPSCALER");
+    BOOL requested = mode && !strcmp(mode, "metalfx");
+    uint64_t encoded, kept;
+    mtl_up_mfx_stats(&encoded, &kept);
+    int last;
+    uint64_t original = mtl_up_game_stats(&last);
+    NSString *effective = last == 2 ? @"MetalFX Spatial" : last == 1 ? @"Original NDSR" : @"Awaiting a recognized dispatch";
+    const char *reason = mtl_up_mfx_fallback();
+    dm_audio_snapshot audio;
+    dm_audio_get_snapshot(&audio);
+    NSString *spatialInput = audio.playing && (audio.apple_spatial_active || audio.binaural_active) ?
+        dmAudioSourceLabel(audio) : @"Inactive";
+    NSArray<NSString *> *rows = @[
+        requested ? @"Requested: MetalFX Spatial" : @"Requested: Original NDSR",
+        [@"Effective (last observed): " stringByAppendingString:effective],
+        [NSString stringWithFormat:@"Dispatches encoded · NDSR %llu · MetalFX %llu",
+            (unsigned long long)original, (unsigned long long)encoded],
+        requested && reason ? [@"Last fallback: " stringByAppendingString:@(reason)] :
+            (requested && !encoded ? @"Fallback: awaiting evidence" : @"Fallback: none reported"),
+        [@"Game audio source: " stringByAppendingString:dmAudioSourceLabel(audio)],
+        [@"Spatial renderer input: " stringByAppendingString:spatialInput],
+        audio.apple_spatial_active ? (audio.apple_speaker_renderer ? @"Spatial renderer: Apple built-in speakers" :
+            @"Spatial renderer: Apple headphones") : (audio.binaural_active ? @"Spatial renderer: Fixed binaural" : @"Spatial renderer: Inactive"),
+        [@"Requested audio mode: " stringByAppendingString:dmAudioRequestedMode(audio)],
+        [@"Effective audio mode: " stringByAppendingString:dmAudioEffectiveMode(audio)],
+        [NSString stringWithFormat:@"Audio output: %@ · %s", dmAudioOutputLabel(audio),
+            audio.device_name[0] ? audio.device_name : "Device unavailable"]
+    ];
+    NSString *fallback = dmAudioFallbackLabel(audio);
+    if (fallback) rows = [rows arrayByAddingObject:[@"Audio fallback: " stringByAppendingString:fallback]];
+    rows = [rows arrayByAddingObjectsFromArray:dmAspectDiagnostics()];
+    rows = [rows arrayByAddingObjectsFromArray:dmFPSDiagnostics()];
+    while (menu.numberOfItems > (NSInteger)rows.count) [menu removeItemAtIndex:menu.numberOfItems - 1];
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        if (i < (NSUInteger)menu.numberOfItems) [menu itemAtIndex:(NSInteger)i].title = rows[i];
+        else [menu addItemWithTitle:rows[i] action:nil keyEquivalent:@""].enabled = NO;
+    }
+}
+- (void)menuNeedsUpdate:(NSMenu *)menu { [self refreshRows:menu]; }
+- (void)menuWillOpen:(NSMenu *)menu {
+    [_refreshTimer invalidate];
+    __weak NSMenu *trackedMenu = menu;
+    __weak DmScalingDiagnostics *delegate = self;
+    _refreshTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        NSMenu *openMenu = trackedMenu;
+        if (openMenu) [delegate refreshRows:openMenu];
+        else [timer invalidate];
+    }];
+    [NSRunLoop.mainRunLoop addTimer:_refreshTimer forMode:NSRunLoopCommonModes];
+}
+- (void)menuDidClose:(NSMenu *)menu {
+    (void)menu;
+    [_refreshTimer invalidate];
+    _refreshTimer = nil;
+}
+@end
+
+static DmScalingDiagnostics *g_scaling_diagnostics;
+
+extern uint64_t mtl_displayed_frame_count(void);
+extern uint64_t mtl_generated_frame_count(void);
+
+enum { DM_FPS_SAMPLES = 120 };
+extern uint64_t dm_fps_snapshot(uint64_t intervals[DM_FPS_SAMPLES]);
+
+@interface DmFPSCounter : NSObject
+- (void)install:(NSMenu *)windowMenu;
+- (NSArray<NSString *> *)diagnostics;
+@end
+
+static DmFPSCounter *g_fps_counter;
+
+@implementation DmFPSCounter {
+    NSStatusItem *_status;
+    NSMenuItem *_menuToggle, *_overlayToggle;
+    NSTextField *_overlay;
+    NSTimer *_timer;
+    double _lastTime, _rendered, _presented;
+    uint64_t _lastRendered, _lastPresented, _lastGenerated;
+    BOOL _visible;
+    unsigned _lastActivityState;
+    BOOL _haveActivityState;
+    NSArray<NSString *> *_rows;
+}
+- (void)install:(NSMenu *)windowMenu {
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{@"DMShowFPS": @YES}];
+    _menuToggle = [windowMenu addItemWithTitle:@"Show FPS in Menu Bar" action:@selector(toggle:) keyEquivalent:@""];
+    _overlayToggle = [windowMenu addItemWithTitle:@"Show FPS Overlay" action:@selector(toggle:) keyEquivalent:@""];
+    _menuToggle.target = self;
+    _overlayToggle.target = self;
+    _overlayToggle.tag = 1;
+    NSView *content = g_win.contentView;
+    _overlay = [NSTextField labelWithString:@"FPS: —"];
+    _overlay.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightMedium];
+    _overlay.textColor = NSColor.whiteColor;
+    _overlay.alignment = NSTextAlignmentCenter;
+    _overlay.drawsBackground = YES;
+    _overlay.backgroundColor = [NSColor.blackColor colorWithAlphaComponent:0.75];
+    _overlay.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:_overlay];
+    [NSLayoutConstraint activateConstraints:@[
+        [_overlay.trailingAnchor constraintEqualToAnchor:content.safeAreaLayoutGuide.trailingAnchor constant:-12],
+        [_overlay.topAnchor constraintEqualToAnchor:content.safeAreaLayoutGuide.topAnchor constant:12],
+        [_overlay.widthAnchor constraintEqualToConstant:72],
+        [_overlay.heightAnchor constraintEqualToConstant:20]
+    ]];
+    [self applyPreferences];
+    __weak DmFPSCounter *weakSelf = self;
+    _timer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer) {
+        DmFPSCounter *counter = weakSelf;
+        if (counter) [counter update]; else [timer invalidate];
+    }];
+    _timer.tolerance = 0.05;
+    [NSRunLoop.mainRunLoop addTimer:_timer forMode:NSRunLoopCommonModes];
+    [self update];
+}
+- (void)toggle:(NSMenuItem *)sender {
+    NSString *key = sender.tag ? @"DMShowFPSOverlay" : @"DMShowFPS";
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setBool:![defaults boolForKey:key] forKey:key];
+    [self applyPreferences];
+    [self update];
+}
+- (void)applyPreferences {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    BOOL show = [defaults boolForKey:@"DMShowFPS"];
+    BOOL overlay = [defaults boolForKey:@"DMShowFPSOverlay"];
+    _menuToggle.state = show ? NSControlStateValueOn : NSControlStateValueOff;
+    _overlayToggle.state = overlay ? NSControlStateValueOn : NSControlStateValueOff;
+    _overlay.hidden = !overlay;
+    if (show && !_status) {
+        _status = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
+        _status.button.title = @"FPS: —";
+        _status.button.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+    } else if (!show && _status) {
+        [NSStatusBar.systemStatusBar removeStatusItem:_status];
+        _status = nil;
+    }
+}
+- (void)update {
+    uint64_t intervals[DM_FPS_SAMPLES];
+    uint64_t rendered = dm_fps_snapshot(intervals), presented = mtl_displayed_frame_count();
+    double now = CACurrentMediaTime(), elapsed = now - _lastTime;
+    // AppKit state is read only on its main thread. Keep every input so a
+    // diagnostic run cannot mistake DM_WINDOW_TOP visibility for activation.
+    BOOL active = NSApp.isActive, miniaturized = g_win.miniaturized;
+    BOOL unoccluded = (g_win.occlusionState & NSWindowOcclusionStateVisible) != 0;
+    BOOL key = g_win.isKeyWindow, onSpace = g_win.isOnActiveSpace;
+    BOOL fullscreen = (g_win.styleMask & NSWindowStyleMaskFullScreen) != 0;
+    BOOL visible = active && !miniaturized && unoccluded;
+    dm_fps_gate gate = dm_fps_gate_reason(active, miniaturized, unoccluded,
+        _visible, _lastTime, elapsed, rendered, _lastRendered, presented, _lastPresented);
+    BOOL measured = gate == DM_FPS_MEASURED;
+    uint64_t renderedDelta = rendered >= _lastRendered ? rendered - _lastRendered : 0;
+    uint64_t presentedDelta = presented >= _lastPresented ? presented - _lastPresented : 0;
+    unsigned activityState = (unsigned)gate | (unsigned)active << 8 | (unsigned)miniaturized << 9 |
+        (unsigned)unoccluded << 10 | (unsigned)key << 11 | (unsigned)onSpace << 12 | (unsigned)fullscreen << 13;
+    BOOL activityChanged = !_haveActivityState || activityState != _lastActivityState;
+    _haveActivityState = YES; _lastActivityState = activityState;
+    if (measured) {
+        _rendered = renderedDelta / elapsed;
+        _presented = presentedDelta / elapsed;
+    } else {
+        _rendered = _presented = 0;
+    }
+    uint64_t generated = mtl_generated_frame_count();
+    BOOL generating = measured && generated > _lastGenerated;
+    _lastGenerated = generated;
+    _lastTime = now;
+    _lastRendered = rendered;
+    _lastPresented = presented;
+    _visible = visible;
+    NSString *text = measured ? [NSString stringWithFormat:@"FPS: %.0f", _presented] : @"FPS: —";
+    _status.button.title = generating ? [NSString stringWithFormat:@"%.0f R · %.0f D", _rendered, _presented] : text;
+    _overlay.stringValue = text;
+    NSMutableArray<NSString *> *rows = [NSMutableArray arrayWithArray:@[
+        measured ? [NSString stringWithFormat:@"Rendered FPS: %.1f", _rendered] : @"Rendered FPS: —",
+        measured ? [NSString stringWithFormat:@"Presented FPS: %.1f", _presented] : @"Presented FPS: —",
+        [NSString stringWithFormat:@"Frame generation: %@ · %llu presented",
+            generating ? @"Active" : @"Inactive", (unsigned long long)generated],
+        @(mtl_framegen_status()),
+        [NSString stringWithFormat:@"FPS sampling: %s", dm_fps_gate_name(gate)],
+        [NSString stringWithFormat:@"App %@ · window %@ · %@ Space",
+            active ? @"active" : @"inactive", miniaturized ? @"minimized" : (unoccluded ? @"visible" : @"occluded"),
+            onSpace ? @"current" : @"another"]
+    ]];
+    NSMutableArray<NSNumber *> *times = [NSMutableArray arrayWithCapacity:DM_FPS_SAMPLES];
+    if (measured && _rendered > 0) {
+        for (unsigned i = 0; i < DM_FPS_SAMPLES; i++)
+            if (intervals[i]) [times addObject:@(intervals[i] / 1e6)];
+    }
+    if (times.count) {
+        [times sortUsingSelector:@selector(compare:)];
+        [rows addObject:[NSString stringWithFormat:@"Game frame time p50 / p95 / p99: %.1f / %.1f / %.1f ms",
+            times[(NSUInteger)ceil(times.count * 0.50) - 1].doubleValue,
+            times[(NSUInteger)ceil(times.count * 0.95) - 1].doubleValue,
+            times[(NSUInteger)ceil(times.count * 0.99) - 1].doubleValue]];
+    }
+    _rows = rows;
+    if (activityChanged || getenv("DM_FPS_COUNTER_LOG"))
+        LOG("FPS counter: %s (rendered %.1f, presented %.1f, %s); gate=%d active=%d minimized=%d visible=%d key=%d active_space=%d fullscreen=%d interval=%.6f rendered_total=%llu rendered_delta=%llu presented_total=%llu presented_delta=%llu guest_frame=%llu host_ns=%llu",
+            text.UTF8String, _rendered, _presented, dm_fps_gate_name(gate), (int)gate,
+            active, miniaturized, unoccluded, key, onSpace, fullscreen, elapsed,
+            (unsigned long long)rendered, (unsigned long long)renderedDelta,
+            (unsigned long long)presented, (unsigned long long)presentedDelta,
+            (unsigned long long)dm_guest_frame(), (unsigned long long)now_ns());
+}
+- (NSArray<NSString *> *)diagnostics { return _rows ?: @[]; }
+@end
+
+static NSArray<NSString *> *dmFPSDiagnostics(void) { return [g_fps_counter diagnostics] ?: @[]; }
+
+@interface DmTerminationDelegate : NSObject <NSApplicationDelegate>
+@end
+
+@implementation DmTerminationDelegate
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+    fg_display_shutdown();
+    if (g_match_orig) screen_match_restore(g_screen_id == g_match_id);
+    dm_haptics_apple_shutdown();
+    kill(getpid(), SIGTERM);
+    return NSTerminateCancel;
+}
+@end
+
+static DmTerminationDelegate *g_termination_delegate;
+
 
 @implementation DmCheatsPanel {
     NSPanel *_panel;              // created once in show, kept for the process's lifetime
@@ -1560,11 +2334,14 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
-    static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
+    static id activity;
+    if (!activity) activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
     if (!getenv("DM_WINDOW")) { guest(); return; }
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        const char *aspect = getenv("DM_SCREEN_ASPECT");
+        g_aspect_match = aspect && !strcmp(aspect, "auto");
         NSRect r = NSMakeRect(0, 0, 1280, 720);
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
@@ -1573,17 +2350,40 @@ void front_run(void (*guest)(void)) {
         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
         win.collectionBehavior = NSWindowCollectionBehaviorFullScreenPrimary;
-        NSView *v = win.contentView = [[DmGameView alloc] initWithFrame:r];
+        BOOL restored = NO;
+        if ([NSBundle.mainBundle.bundleIdentifier hasPrefix:@"org.nxnative.oot.ascension."]) {
+            [win setFrameAutosaveName:@"AscensionGameWindow"];
+            restored = [win setFrameUsingName:@"AscensionGameWindow"];
+            r = win.contentView.bounds;
+        }
+        DmGameView *v = [[DmGameView alloc] initWithFrame:r];
+        g_game_view = v;
+        if (g_aspect_match) {
+            // Native safe-area constraints keep the drawable itself out of the
+            // notch/titlebar. Never subtract a hard-coded screen inset (AppKit
+            // may already have placed fullscreen in a compatible safe region).
+            NSView *content = [[NSView alloc] initWithFrame:r];
+            content.wantsLayer = YES; content.layer.backgroundColor = NSColor.blackColor.CGColor;
+            win.contentView = content;
+            v.translatesAutoresizingMaskIntoConstraints = NO;
+            [content addSubview:v];
+            NSLayoutGuide *safe = content.safeAreaLayoutGuide;
+            [NSLayoutConstraint activateConstraints:@[
+                [v.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor],
+                [v.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor],
+                [v.topAnchor constraintEqualToAnchor:safe.topAnchor],
+                [v.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor]
+            ]];
+            [content layoutSubtreeIfNeeded];
+        } else win.contentView = v;
         v.wantsLayer = YES;
         g_layer = [CAMetalLayer layer];
         g_layer.device = MTLCreateSystemDefaultDevice();
-        g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        update_display_range(win.screen ?: NSScreen.mainScreen);
         g_layer.contentsScale = win.backingScaleFactor;
-        // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
-        // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
-        if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) LOG("front end: Metal performance HUD on (DM_METAL_HUD)");
+        if (g_hud_available) set_performance_hud(g_hud_visible);
         v.layer = g_layer; [(DmGameView *)v fitDrawable];
-        [win center];
+        if (!restored) [win center];
         [win makeKeyAndOrderFront:nil];
         screen_refresh(win.screen ?: NSScreen.mainScreen);
         g_win = win;
@@ -1597,6 +2397,8 @@ void front_run(void (*guest)(void)) {
             if (v) LOG("front end: window visible"); else LOG("front end: window covered (its display link fires about once a second: frame times measure nothing)"); }];
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
+        g_termination_delegate = [DmTerminationDelegate new];
+        NSApp.delegate = g_termination_delegate;
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
         [app addItemWithTitle:[@"Quit " stringByAppendingString:@(DM_GAME_NAME)] action:@selector(terminate:) keyEquivalent:@"q"];
         // Cheats (hle_cheats.c): the rows rebuild on every open through the delegate, the same rows the file reload changes
@@ -1609,12 +2411,77 @@ void front_run(void (*guest)(void)) {
         // Cheats menu has been opened once. Every open rebuilds them through the delegate as before
         [g_cheats_menu menuNeedsUpdate:cm];
         [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
+        // Restore a saved audio preference before the guest begins opening AudioOut.
+        // Staged test bundles must use a separate bundle ID / preference domain.
+        id audioChoice = [[NSUserDefaults standardUserDefaults] objectForKey:kDmAudioPrefKey];
+        if ([audioChoice isKindOfClass:[NSNumber class]])
+            dm_audio_mode_set((dm_audio_mode)[(NSNumber *)audioChoice integerValue]);
+        g_audio_menu = [DmAudioMenuDelegate new];
+        NSMenu *am = [[NSMenu alloc] initWithTitle:@"Sound"];
+        am.delegate = g_audio_menu;
+        am.autoenablesItems = NO;
+        [g_audio_menu menuNeedsUpdate:am];
+        [[bar addItemWithTitle:@"Sound" action:nil keyEquivalent:@""] setSubmenu:am];
+        if ([NSBundle.mainBundle.bundleIdentifier hasPrefix:@"org.nxnative.oot.ascension."]) {
+            g_display_menu = [DmDisplayMenuDelegate new];
+            NSMenu *display = [[NSMenu alloc] initWithTitle:@"Display"];
+            display.delegate = g_display_menu; display.autoenablesItems = NO;
+            [g_display_menu menuNeedsUpdate:display];
+            [[bar addItemWithTitle:@"Display" action:nil keyEquivalent:@""] setSubmenu:display];
+            g_picture_menu = [DmPictureMenuDelegate new];
+            NSMenu *picture = [[NSMenu alloc] initWithTitle:@"Picture"];
+            picture.delegate = g_picture_menu;
+            [g_picture_menu menuNeedsUpdate:picture];
+            [[bar addItemWithTitle:@"Picture" action:nil keyEquivalent:@""] setSubmenu:picture];
+            g_scaling_diagnostics = [DmScalingDiagnostics new];
+            NSMenu *diagnostics = [[NSMenu alloc] initWithTitle:@"Diagnostics"];
+            diagnostics.delegate = g_scaling_diagnostics;
+            [[bar addItemWithTitle:@"Diagnostics" action:nil keyEquivalent:@""] setSubmenu:diagnostics];
+        }
         if (getenv("DM_CHEATS_WINDOW") && atoi(getenv("DM_CHEATS_WINDOW")))   // the Cheats panel open from the start (beside the game, not key)
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        if (g_hud_available) {
+            NSMenuItem *hud = [wm addItemWithTitle:@"Performance HUD" action:@selector(togglePerformanceHUD:) keyEquivalent:@"h"];
+            hud.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
+            hud.target = v;
+            hud.state = g_hud_visible ? NSControlStateValueOn : NSControlStateValueOff;
+        }
+        if (!strcmp(DM_GAME_ID, "0400486024DEC000")) {
+            NSMenu *mode = [[NSMenu alloc] initWithTitle:@"Console Mode"];
+            NSArray<NSString *> *titles = @[@"Handheld", @"Docked"];
+            for (NSInteger value = 0; value < (NSInteger)titles.count; value++) {
+                NSMenuItem *item = [mode addItemWithTitle:titles[value]
+                                                  action:@selector(selectConsoleMode:) keyEquivalent:@""];
+                item.target = v;
+                item.tag = value;
+                item.state = value == dm_opmode() ? NSControlStateValueOn : NSControlStateValueOff;
+            }
+            [[wm addItemWithTitle:@"Console Mode" action:nil keyEquivalent:@""] setSubmenu:mode];
+        }
         NSApp.mainMenu = bar;
+        if (g_scaling_diagnostics) {
+            g_fps_counter = [DmFPSCounter new];
+            [g_fps_counter install:wm];
+        }
+        // Match chooses the usable shape only once, after the native fullscreen
+        // transition if requested. Notification, refusal and timeout all share
+        // this main-thread guard, so the guest can never start twice.
+        __block BOOL guestStarted = NO;
+        void (^startGuest)(void) = ^{
+            if (guestStarted) return;
+            guestStarted = YES;
+            [win.contentView layoutSubtreeIfNeeded]; [v fitDrawable];
+            front_resolve_aspect();
+            static guest_arg ga; ga.fn = guest;
+            pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
+            pthread_t th; int error = pthread_create(&th, &a, guest_tramp, &ga);
+            pthread_attr_destroy(&a);
+            if (error) die("pthread_create guest");
+        };
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
+        BOOL waitForFullscreen = g_aspect_match && fs && strcmp(fs, "0");
         if (fs && strcmp(fs, "0")) {
             // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen
             // (whichever happens last), and repeat a refused startup request once. Only a request made here owns a retry; a later player request must never restart startup handling
@@ -1627,7 +2494,7 @@ void front_run(void (*guest)(void)) {
                 if (!entering) return;
                 entering = 0;
                 LOG("front end: fullscreen was refused (app active %d, window on the active Space %d)%s", NSApp.isActive, win.isOnActiveSpace, retried ? "" : ", asking once more");
-                if (retried) return;
+                if (retried) { if (waitForFullscreen) dispatch_async(dispatch_get_main_queue(), startGuest); return; }
                 retried = 1; want = 1; dispatch_async(dispatch_get_main_queue(), enter); };
             [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; enter(); }];
             [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; enter(); }];
@@ -1636,7 +2503,9 @@ void front_run(void (*guest)(void)) {
                     (void)n; want = 0;
                     if (!entering) g_fs_failed = nil; }];   // the player took over while startup was waiting; our own transition has entering set
             [NSNotificationCenter.defaultCenter addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) {
-                (void)n; want = 0; entering = 0; g_fs_failed = nil; }];   // startup succeeded: later manual refusals have no startup request to retry
+                (void)n; want = 0; entering = 0; g_fs_failed = nil;
+                if (waitForFullscreen) dispatch_async(dispatch_get_main_queue(), startGuest);
+            }];   // startup succeeded: later manual refusals have no startup request to retry
             dispatch_async(dispatch_get_main_queue(), enter);
         }
         for (NSNotificationName nm in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
@@ -1656,16 +2525,22 @@ void front_run(void (*guest)(void)) {
             return nil;   // Swallow it to avoid the system beep
         }];
         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
-                                                      usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
+                                                      usingBlock:^(NSNotification *n) { (void)n; [NSApp terminate:nil]; }];
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1).
         // Input is released when the window stops being key (and when it is minimized) and taken up again when it is key again
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); if (win.screen) g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); }];
+        [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil
+                            queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            (void)note;
+            screen_refresh(win.screen);
+            update_display_range(win.screen);
+            [win.contentView layoutSubtreeIfNeeded]; [v fitDrawable];
+        }];
+        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); update_display_range(win.screen); if (win.screen) g_layer.contentsScale = win.backingScaleFactor; [win.contentView layoutSubtreeIfNeeded]; [v fitDrawable]; screen_match_apply(); }];
         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
-        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; dmRememberFullscreen(YES); g_layer.contentsScale = win.backingScaleFactor; [win.contentView layoutSubtreeIfNeeded]; [v fitDrawable]; screen_match_apply(); }];
+        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; dmRememberFullscreen(NO); screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; [win.contentView layoutSubtreeIfNeeded]; [v fitDrawable]; screen_match_apply(); }];
         // DM_FOCUS_KEEP=1 (scripts/regress.py): the game stays in focus while its window is up, whichever app is active. Tears of the Kingdom stops presenting out of focus, so
         // another app taking the key window during an unattended run read as a hang (no frame after the last focus change)
         static int keep = -1; if (keep < 0) keep = getenv("DM_FOCUS_KEEP") && atoi(getenv("DM_FOCUS_KEEP"));
@@ -1674,10 +2549,13 @@ void front_run(void (*guest)(void)) {
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
         display_awake(win.isKeyWindow);   // the window may have become key (makeKeyAndOrderFront above) before these observers were installed
-        // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
-        static guest_arg ga; ga.fn = guest;
-        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
-        pthread_t th; if (pthread_create(&th, &a, guest_tramp, &ga)) die("pthread_create guest");
+        if (waitForFullscreen) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                if (guestStarted) return;
+                LOG("front end: fullscreen aspect startup timed out; using the current native game view");
+                startGuest();
+            });
+        } else startGuest();
         [NSApp run];
     }
 }
@@ -1717,7 +2595,7 @@ void front_progress(const char *title, long done, long total) {
 
 // Offline HTML pages (web_apple.m): the page's view covers the game view and resizes with it; it is the first responder while shown (front_web_show), and the game view again after
 void front_web_attach(NSView *box) { NSView *v = g_win.contentView; box.frame = v.bounds; [v addSubview:box]; }
-void front_web_detach(NSView *box) { if (box.window && box.window.firstResponder != box.window.contentView) [box.window makeFirstResponder:box.window.contentView]; }
+void front_web_detach(NSView *box) { if (box.window && box.window.firstResponder != g_game_view) [box.window makeFirstResponder:g_game_view ?: box.window.contentView]; }
 
 // Software keyboard input box (front.h): the main thread shows an NSAlert + text field and the guest thread waits synchronously for the result. Not shown in windowless mode (returns -1, the caller treats it as cancel)
 extern int g_swkbd_min_chars;   // hle_swkbd.c: this input's minimum length from ShowKeyboardArg; the applet keeps OK disabled until the text is long enough
@@ -1756,8 +2634,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
 
 // GPU lost (front.h): macOS runs none of the game's GPU work any more and nothing is drawn again. In full screen the frozen game held the whole screen (#1326: WindowServer froze for 40 s
 // and its watchdog killed it), so the window leaves full screen first and the alert comes once it has, or after 3 s if it has not. Then the app quits with exit status 70
-// (EX_SOFTWARE), so a launcher or script that runs it sees a failed run: exit() runs the same atexit handlers as ⌘Q's terminate (the one will-terminate
-// observer, haptics_apple.m's, is an atexit handler too), whose exit status is 0
+// (EX_SOFTWARE), so a launcher or script that runs it sees a failed run. exit() also runs the registered atexit handlers.
 void front_gpu_lost(void) {
     if (!g_layer) die("GPU access revoked: macOS runs none of this process's GPU work any more");
     LOG("front end: the GPU no longer runs the game's work; telling the player and quitting");

@@ -182,11 +182,40 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *home = getenv("HOME"); if (!home || !*home) return 1;
+    char bundle_id[256] = "";
+    info_string("CFBundleIdentifier", bundle_id, sizeof bundle_id);
+    int resonance = !strcmp(bundle_id, "org.nxnative.oot.resonance.fresh");
+    int ascension_ui = !strcmp(bundle_id, "org.nxnative.oot.ascension.interface");
+    int ascension_updated = !strcmp(bundle_id, "org.nxnative.oot.ascension.updated");
+    int ascension_qualification = !strcmp(bundle_id, "org.nxnative.oot.ascension.qualification");
+    int ascension_diagnostics = !strcmp(bundle_id, "org.nxnative.oot.ascension.diagnostics");
+    int ascension_preflight = !strcmp(bundle_id, "org.nxnative.oot.ascension.preflight");
+    int ascension_final = !strcmp(bundle_id, "org.nxnative.oot.ascension.final");
+    int ascension_fps = !strcmp(bundle_id, "org.nxnative.oot.ascension.fps");
+    int ascension_release = !strcmp(bundle_id, "org.nxnative.oot.ascension.release");
+    int ascension_ownership = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.ownership");
+    int ascension_final_candidate = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.finalcandidate");
+    int ascension_final_20261114 = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.final20261114");
+    int ascension_aspect_20261114 = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.aspect20261114");
+    int ascension_latest_20261115 = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.latest20261115");   // Ascension on upstream 23790f8d: own saves and preferences
+    int ascension_consolidation = ascension_latest_20261115 || ascension_aspect_20261114 || ascension_final_20261114 || ascension_final_candidate || ascension_ownership || !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.consolidation");
+    int ascension_gpu_startup = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.gpustartup");
+    int ascension_ultra = !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.ultra");
+    int ascension_fg_hdr = ascension_consolidation || ascension_gpu_startup || ascension_ultra || !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen.hdr");
+    int ascension_framegen = ascension_fg_hdr || !strcmp(bundle_id, "org.nxnative.oot.ascension.framegen");
+    int ascension = ascension_framegen || ascension_release || ascension_fps || ascension_final || ascension_preflight || ascension_diagnostics || ascension_qualification || ascension_updated || ascension_ui || !strcmp(bundle_id, "org.nxnative.oot.ascension.rc");
+    int isolated = resonance || ascension;
+    const char *storage_id = ascension_latest_20261115 ? "0400486024DEC000-ascension-latest20261115" : ascension_aspect_20261114 ? "0400486024DEC000-ascension-aspect20261114" : ascension_final_20261114 ? "0400486024DEC000-ascension-final20261114" : ascension_final_candidate ? "0400486024DEC000-ascension-finalcandidate" : ascension_ownership ? "0400486024DEC000-ascension-ownership" : ascension_consolidation ? "0400486024DEC000-ascension-consolidation" : ascension_gpu_startup ? "0400486024DEC000-ascension-gpu-startup" : ascension_ultra ? "0400486024DEC000-ascension-ultra" : ascension_fg_hdr ? "0400486024DEC000-ascension-framegen-hdr" : ascension_framegen ? "0400486024DEC000-ascension-framegen" : ascension_release ? "0400486024DEC000-ascension-release" : ascension_fps ? "0400486024DEC000-ascension-fps" : ascension_final ? "0400486024DEC000-ascension-final" : ascension_preflight ? "0400486024DEC000-ascension-preflight" :
+        ascension_diagnostics ? "0400486024DEC000-ascension-diagnostics" :
+        ascension_qualification ? "0400486024DEC000-ascension-qualification" :
+        ascension_updated ? "0400486024DEC000-ascension-updated" :
+        ascension_ui ? "0400486024DEC000-ascension-interface" : ascension ? "0400486024DEC000-ascension-rc" :
+        resonance ? "0400486024DEC000-resonance-fresh" : id;
     char sup[PATH_MAX], save[PATH_MAX], temp[PATH_MAX], logs[PATH_MAX], log[PATH_MAX], prev[PATH_MAX];
-    snprintf(sup, sizeof sup, "%s/Library/Application Support/nxnative/%s", home, id);
+    snprintf(sup, sizeof sup, "%s/Library/Application Support/nxnative/%s", home, storage_id);
     snprintf(save, sizeof save, "%s/save", sup); snprintf(temp, sizeof temp, "%s/temp", sup);
     snprintf(logs, sizeof logs, "%s/Library/Logs/nxnative", home);
-    snprintf(log, sizeof log, "%s/%s.log", logs, id); snprintf(prev, sizeof prev, "%s/%s.prev.log", logs, id);
+    snprintf(log, sizeof log, "%s/%s.log", logs, storage_id); snprintf(prev, sizeof prev, "%s/%s.prev.log", logs, storage_id);
     mkdirs(save); mkdirs(temp); mkdirs(logs);
     rename(log, prev);
     int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -198,15 +227,36 @@ int main(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/env.txt", dm); env_file(p);
     setenv("DM_ENV_FILE_KEYS", g_file_keys ? g_file_keys : "", 1); setenv("DM_ENV_LAUNCH_KEYS", g_launch_keys ? g_launch_keys : "", 1);
     free(g_file_keys); free(g_launch_keys);
-    setenv("DM_SAVE", save, 0);   // before the window: its cloud-save check compares this save with the cloud's (Launcher.swift SaveCheck)
+    if (isolated) setenv("DM_SAVE_SYNC", "", 1);
+    setenv("DM_SAVE", save, isolated);   // before the window: its cloud-save check compares this save with the cloud's (Launcher.swift SaveCheck)
+    extern void dm_ascension_migrate_preferences(void);
+    if (ascension_framegen) dm_ascension_migrate_preferences();
     int window = !(getenv("DM_LAUNCHER") && !strcmp(getenv("DM_LAUNCHER"), "0"));
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--no-launcher")) window = 0;
     if (!window) fprintf(stderr, "launcher: no settings window (DM_LAUNCHER=0 or --no-launcher)\n");
     int shown = window ? dm_mac_launcher() : 2;
     if (!shown) return 0;   // Quit: no game
     if (shown == 2) saved_choices();
-    cloud_saves_folder();
-    setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_TEMP", temp, 0);
+    if (isolated) {
+        setenv("DM_FPS_TARGET", "30", 0);
+        setenv("DM_OPMODE", "1", 0);
+        setenv("DM_FULLSCREEN", "1", 0);
+        setenv("DM_RT", "0", 0);
+        setenv("DM_EXPERIMENTAL_HDR", "1", 0);
+        setenv("DM_AUDIO_51", "1", 0);
+        setenv("DM_SAVE_SYNC", "", 1);
+        if (ascension) {
+            setenv("DM_GFX_SCALE", "0", 0);
+            setenv("DM_NVN_ENC_THREAD", "1", 0);
+        }
+        fprintf(stderr, "launcher: isolated saves at %s (cloud sync off)\n", save);
+    } else cloud_saves_folder();
+    const char *fg = getenv("DM_FRAMEGEN"), *up = getenv("DM_UPSCALER");
+    if (ascension_framegen && fg && !strcmp(fg, "1") && up && !strcmp(up, "metalfx")) {
+        setenv("DM_NVN_ENC_THREAD", "0", 1);
+        setenv("DM_PRESENT_LINK", "0", 0);
+    }
+    setenv("DM_ROOT", sup, isolated); setenv("DM_ROMFS", romfs, 0); setenv("DM_TEMP", temp, isolated);
     snprintf(p, sizeof p, "%s/Library/Application Support/nxnative/system", home); setenv("DM_SYSTEM_DIR", p, 0);   // the player's own console files, for every game
     snprintf(p, sizeof p, "%s/msl", res); setenv("DM_MSL_DIR", p, 0);
     snprintf(p, sizeof p, "%s/font", dm); setenv("DM_FONT_DIR", p, 0);

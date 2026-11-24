@@ -52,7 +52,7 @@ static uint8_t *put(uint8_t *q, int sdk, int id, int size) {
     }
     return q + size;
 }
-static size_t build(int sdk, int ncmd) {
+static size_t build_channels(int sdk, int ncmd, unsigned channels) {
     memset(list, 0, sizeof list);
     *(uint32_t *)(list + 4) = (uint32_t)ncmd; *(const int32_t **)(list + 8) = mix; *(uint32_t *)(list + 0x14) = SAMPLES; *(uint32_t *)(list + 0x18) = 48000;
     uint8_t *q = list + 0x20;
@@ -60,11 +60,14 @@ static size_t build(int sdk, int ncmd) {
     int id = sdk <= 5 ? 0xf : sdk == 6 ? 0x10 : sdk == 21 ? 0x14 : 0x13;
     uint8_t *sink = q; q = put(q, sdk, id, sdk == 4 ? 0x130 : sdk == 5 ? 0x138 : sdk == 21 ? 0x140 : 0x148);
     int count = sdk <= 5 ? 0x120 : sdk == 21 ? 0x128 : 0x130;
-    *(uint32_t *)(sink + count) = 2;
-    if (sdk == 4) { sink[0x124] = 0; sink[0x125] = 1; }
-    else { *(int16_t *)(sink + count + 4) = 0; *(int16_t *)(sink + count + 6) = 1; }
+    *(uint32_t *)(sink + count) = channels;
+    for (unsigned c = 0; c < channels; c++) {
+        if (sdk == 4) sink[0x124 + c] = (uint8_t)c;
+        else *(int16_t *)(sink + count + 4 + 2 * c) = (int16_t)c;
+    }
     return (size_t)(q - list);
 }
+static size_t build(int sdk, int ncmd) { return build_channels(sdk, ncmd, 2); }
 
 static void test_headers(void) {
     const int sdks[] = {4, 5, 6, 16, 21};
@@ -123,6 +126,24 @@ static void test(int sdk, int incomplete) {
     for (int s = 0; s < SAMPLES; s++) assert(out[2 * s] == 1000 && out[2 * s + 1] == -1000);
     n = build(sdk, NCMD);
     assert(capture(&g_ar[0], list, n, out) == SAMPLES);   // detection stays valid for later full frames
+}
+
+// Discrete AudioRenderer 5.1 fixture for each SDK's DeviceSink layout.
+// Distinct samples prove FL, FR, C, LFE, BL, BR remain in order, with no
+// accidental stereo downmix. Guard the end of the destination against overruns.
+static void test_surround(int sdk) {
+    g_sink_id = sdk == 21 ? 0x14 : 0x13;
+    g_ar[0].output_ch = 6;
+    for (int c = 0; c < 6; c++) for (int s = 0; s < SAMPLES; s++)
+        mix[c * SAMPLES + s] = (c + 1) * 1000 + (s % 17);
+    size_t n = build_channels(sdk, NCMD, 6);
+    enum { GUARD = 16 };
+    int16_t out[SAMPLES * 6 + GUARD];
+    for (size_t i = 0; i < sizeof out / sizeof out[0]; i++) out[i] = -20000;
+    assert(capture(&g_ar[0], list, n, out) == SAMPLES);
+    for (int s = 0; s < SAMPLES; s++) for (int c = 0; c < 6; c++)
+        assert(out[s * 6 + c] == (c + 1) * 1000 + (s % 17));
+    for (int j = 0; j < GUARD; j++) assert(out[SAMPLES * 6 + j] == -20000);
 }
 
 // Malformed lists after layout selection must leave the histogram/sink scan pending
@@ -196,9 +217,15 @@ static void test_two_renderers(void) {
     int32_t quiet[2 * 160] = {0}, loud[2 * 160], out[2 * 240];
     for (int i = 0; i < 2 * 160; i++) loud[i] = 20000;
     memset(g_ar, 0, sizeof g_ar);
-    assert(up_3_2(&g_ar[0], loud, 160, out) == 240);
-    assert(up_3_2(&g_ar[1], quiet, 160, out) == 240);
+    assert(up_3_2(&g_ar[0], loud, 160, out, 2) == 240);
+    assert(up_3_2(&g_ar[1], quiet, 160, out, 2) == 240);
     for (int i = 0; i < 2 * 240; i++) assert(out[i] == 0);
+    int32_t quiet6[6 * 160] = {0}, loud6[6 * 160], out6[6 * 240];
+    for (int i = 0; i < 6 * 160; i++) loud6[i] = 20000;
+    memset(g_ar, 0, sizeof g_ar);
+    assert(up_3_2(&g_ar[0], loud6, 160, out6, 6) == 240);
+    assert(up_3_2(&g_ar[1], quiet6, 160, out6, 6) == 240);
+    for (int i = 0; i < 6 * 240; i++) assert(out6[i] == 0);
     memset(g_ar, 0, sizeof g_ar);
 }
 
@@ -206,7 +233,8 @@ static void test_two_renderers(void) {
 // Renderer 0 queues all its blocks and none plays; renderer 1 then renders (blocks_exec marks each frame with its renderer) and renderer 0's blocks must still hold its samples
 static void blocks_exec(void *obj, void *state) {
     (void)obj; (void)state;
-    for (int i = 0; i < SAMPLES * 2; i++) t_ar->frame[i] = (int16_t)(ar_index(t_ar) + 1);
+    int channels = t_ar->output_ch == 6 ? 6 : 2;
+    for (int i = 0; i < SAMPLES * channels; i++) t_ar->frame[i] = (int16_t)(ar_index(t_ar) + 1);
     t_ar->frame_n = SAMPLES;
 }
 static void test_renderer_blocks(void) {
@@ -222,6 +250,27 @@ static void test_renderer_blocks(void) {
         }
     }
     memset(g_ar, 0, sizeof g_ar);
+}
+
+// The 5.1 output queue must allocate and preserve a full six-channel frame;
+// a stereo-sized memcpy silently truncates the center and surround channels.
+static void test_renderer_six_blocks(void) {
+    memset(g_ar, 0, sizeof g_ar);
+    memset(blocks_n, 0, sizeof blocks_n);
+    blocks_on = 1;
+    g_ar[0].output_ch = 6;
+    atomic_store(&g_ar[0].open, 1);
+    render_main(&g_ar[0]);
+    blocks_on = 0;
+    assert(blocks_n[0] == NBUF);
+    for (int i = 0; i < NBUF; i++) {
+        const aout_buf *b = blocks[0][i];
+        assert(b->size == SAMPLES * 6 * sizeof(int16_t));
+        const int16_t *pcm = b->ptr;
+        for (int j = 0; j < SAMPLES * 6; j++) assert(pcm[j] == 1);
+    }
+    memset(g_ar, 0, sizeof g_ar);
+    memset(blocks_n, 0, sizeof blocks_n);
 }
 
 // The update lock is read off Update, else off UpdateImpl; a miss keeps the caller's offset and is a red line. Built from prologues of the forms the SDKs have (`bl` into a PLT stub or straight to the function)
@@ -275,22 +324,24 @@ int main(int argc, char **argv) {
     test_update_lock();
     test_two_renderers();
     test_renderer_blocks();
+    test_renderer_six_blocks();
     if (argc == 2 && !strcmp(argv[1], "--histogram")) { test_histogram(); return 0; }
     if (argc == 2 && !strcmp(argv[1], "--malformed")) { test_malformed(16, 0); return 0; }
     test_headers();
     const int sdks[] = {4, 5, 6, 16, 21};
-    for (size_t i = 0; i < sizeof sdks / sizeof *sdks; i++) for (int scenario = 0; scenario <= 4; scenario++) {
+    for (size_t i = 0; i < sizeof sdks / sizeof *sdks; i++) for (int scenario = 0; scenario <= 5; scenario++) {
         // Each renderer format starts in a fresh process, including capture's one-time layout and sink detection.
         pid_t pid = fork(); assert(pid >= 0);
         if (!pid) {
             if (scenario <= 1) test(sdks[i], scenario);
-            else test_malformed(sdks[i], scenario - 2);
+            else if (scenario <= 4) test_malformed(sdks[i], scenario - 2);
+            else test_surround(sdks[i]);
             _exit(0);
         }
         int status; assert(waitpid(pid, &status, 0) == pid);
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     test_histogram();
-    puts("audren layout: update lock read off Update or UpdateImpl, renderers' own blocks, bounded histograms, malformed-list rejection, unaligned and truncated headers, SDK 4/5/6/16/21 stereo PCM and empty/incomplete startup recovery passed");
+    puts("audren layout: update lock read off Update or UpdateImpl, renderers' own blocks, bounded histograms, malformed-list rejection, unaligned and truncated headers, SDK 4/5/6/16/21 stereo and 5.1 PCM, 2/6-channel resampling and empty/incomplete startup recovery passed");
     return 0;
 }

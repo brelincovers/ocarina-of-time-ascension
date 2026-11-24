@@ -89,6 +89,29 @@ static int test_buffer_layout(void) {
     puts("buffer layout: the data at +0x08 played for the data size at +0x18, next at +0x00 left as the game linked it");
     return 0;
 }
+// Phase-1 surround prototype: the explicit six-channel route must preserve every
+// sample and the original guest buffer release semantics (no PCM remapping at all).
+static int test_surround_passthrough(void) {
+    enum { FRAMES = 273, SPLIT = 17 };
+    int16_t in[FRAMES * 6], out[FRAMES * 6];
+    for (int f = 0; f < FRAMES; f++) for (int c = 0; c < 6; c++)
+        in[6 * f + c] = (int16_t)((f * 101 + c * 2003) % 65536 - 32768);
+    memset(out, 0, sizeof out);
+    aout_buf b[2] = {0}; set_buf(&b[0], in, SPLIT * 12, SPLIT * 12); set_buf(&b[1], in + SPLIT * 6, (FRAMES - SPLIT) * 12, (FRAMES - SPLIT) * 12);
+    aout a = {.ch = 6, .output_ch = 6};
+    atomic_init(&a.state, STATE_STARTED); atomic_init(&a.vol, 0x3f800000u);
+    a.q[0] = b; a.q[1] = b + 1; atomic_init(&a.q_tail, 2);
+    AudioBufferList bl = {.mNumberBuffers = 1, .mBuffers = {{6, sizeof out, out}}};
+    au_render(&a, NULL, NULL, 0, FRAMES, &bl);
+    if (memcmp(in, out, sizeof in) != 0 || atomic_load(&a.q_head) != 2 ||
+        atomic_load(&a.rel_tail) != 2 || a.rel[0] != b || a.rel[1] != b + 1 ||
+        a.pos || atomic_load(&a.under_n)) {
+        puts("FAIL 5.1 pass-through: sample preservation or buffer release order");
+        return 1;
+    }
+    puts("5.1 pass-through: bit-preserving six channels and split-buffer release verified");
+    return 0;
+}
 // The guest AudioOut's front as the SDK fills it (au_info), and its lifetime under a guard like the middleware's: open, play, go to the background, close only if the first word says open,
 // make the PCM inaccessible (a consumer left running would fault on it) and come back, 12 times (PR #109). Old pages stay mapped PROT_NONE, so no new buffer lands at a stale address
 static int test_output_lifetime(void) {
@@ -120,7 +143,7 @@ static int test_output_lifetime(void) {
     return 0;
 }
 int main(void) {
-    if (test_buffer_layout() || test_surround_output() || test_output_lifetime()) return 1;
+    if (test_buffer_layout() || test_surround_output() || test_surround_passthrough() || test_output_lifetime()) return 1;
     char out[64], ev[64]; uint8_t prm[16]; aout_buf b[3]; static int16_t pcm[3][4800 * 2];
     h_au_InitParam(prm);
     if (h_au_Open(out, ev, NULL, prm)) return 1;

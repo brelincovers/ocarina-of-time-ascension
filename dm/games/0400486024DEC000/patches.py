@@ -1,6 +1,6 @@
 # The Legend of Zelda: Ocarina of Time (0400486024DEC000): the rewriter's patches of this game's own code. dm/tools/patch_nso.py loads every profile's patches.py;
 # MATCH_FRAME_STEP as described there ("Registered patches"). Patches of Nintendo SDK module builds are in dm/tools/sdk_patches.py
-from nso_asm import ADRP, B
+from nso_asm import ADRP, B, STP, LDP, STP_PRE, LDP_POST, LDRX, ADDI
 
 # The game's frame ratio. Once a frame the function at main+0x6e6be0 (v131072) divides its base rate (60.0, or 30.0 while bit 0 of [x21+0x24f] is set) by the int frame rate at
 # [x21+0x2c8] (fdiv s8,s1,s0 at +0xe4) and hands the result to the time object (main+0x3b4e300: ratio at +0x10, 1 / ratio at +0x14, round(60 / ratio) at +0x1c), which the game
@@ -61,6 +61,240 @@ drs_controller = (   # drs_stub.s, assembled with clang; x0 the controller, x16 
     0xb9020e1f, 0xbc2258e0, 0xb8225904, 0x34000182, 0x51000449, 0xb869590a, 0x340000ea, 0x4b0a008a,   # fits: record it; at 0 stay; the level above's record
     0x7109615f, 0x54000088, 0xbc6958e2, 0x1e212040, 0x540000aa, 0x2a0903e0, 0xd65f03c0,               # never, stale or fitting: up one
     0x2a1f03e0, 0xd65f03c0, 0x2a0203e0, 0xd65f03c0)                                                   # 0; or stay
+# Ascension: adapted from upstream PR2651, head1425a3fd6f50aafaa0654595db6b55ddeb128d26.
+# Original v131072 e0f3ccfaf50065ae4ea01eb5aeb13b1a fingerprints and instructions
+# checked read-only on 2026-11-14. Runtime/HDR/FG/transition qualification remains separate.
+SCREEN_SHAPE_SITES = (
+    ('graphics init', 0x204, '08b4c0f2'),
+    ('graphics init', 0x3c0, '8886e8f2'),
+    ('scene app init', 0x168, '08b4c0f2'),
+    ('scene app init', 0x174, '0887c0f2'),
+    ('base scene defaults', 0x38c, '0887c0f2'),
+    ('base scene defaults', 0x39c, '085ac0f2'),
+    ('display mgr defaults', 0xc, '0a878052'),
+    ('base res read', 0x114, 'e890a852'),
+    ('display target a', 0x44, '0887c0f2'),
+    ('display target b', 0x110, '0887c0f2'),
+    ('display target c', 0x130, '0887c0f2'),
+    ('layout ortho', 0x208, 'e62bc03d'),
+    ('layout view ortho', 0x398, '0004402d'),
+    ('scene camera writer', 0x1ec, '4440211e'),
+    ('perspective proj', 0x0, '0084552d'),
+    ('layout calc matrix', 0x19c, '6042883c'),
+)
+
+# Exact ordered pane-name vectors from original BFFH assets; not arbitrary
+# PicturePane names. Research provenance: Display Aspect/research-20261114.
+SCREEN_FADE_LAYOUTS = (
+    ('RootPane', 'P_StaffCreditBlack_00', 'N_In_00', 'P_Black_00', 'N_WhiteIn_00', 'P_White_00', 'P_White_01', 'N_WhiteOut_00', 'P_White_02'),
+    ('RootPane', 'N_In_00', 'P_Fade_00', 'N_IconIn_00', 'N_LoadIcon_00', 'P_Sh_00', 'P_Base_00', 'P_Deco_00', 'N_Glow_00', 'P_Parts_00', 'P_Parts_01', 'P_Parts_02'),
+)
+SCREEN_FADE_DEPENDENCIES = ('layout pane name', 'layout pane index', 'layout pane owner', 'layout pane enumeration')
+
+
+def screen_fade_stub(start, state, back):
+    # x21 is the compact pane record, NOT nn::ui2d::Pane. main+0x43ace0
+    # gives owner at +0x18; main+0x15276d0 indexes its +0x100 array (stride
+    # 0xb0); main+0x771cf0 resolves names through owner+0xf8 -> +0x20.
+    # main+0x43ad00 iterates owner+0x13c panes. All four functions are matched.
+    # Save x9..x14; x8 is LIVE across the hook. No guest calls or allocations.
+    words, labels, refs = [], {}, []
+    def emit(w): words.append(w)
+    def label(name): labels[name] = start + len(words) * 4
+    def ref(kind, target, value=0): refs.append((len(words), kind, target, value)); emit(0)
+    emit(ADRP(16, start, state))
+    # Original type/size checks, with every reject returning to the original store.
+    geometry = (0xb9404a11, 0x34000351, 0xb940aab1, 0x53166631, 0x7100063f, 0x540002c1, 0x2d4b0ea2,
+                0x52a88f51, 0x1e270224, 0x1e242040, 0x54000224, 0x52a885f1, 0x1e270224, 0x1e242060,
+                0x540001a4, 0x1e245004, 0x1e261005, 0x1e240844, 0x1e250865, 0x1e253884, 0x1e20c084,
+                0x52a86911, 0x1e270225, 0x1e252080, 0x5400006a)
+    for w in geometry:
+        if w & 0x7f000000 == 0x34000000: ref('cbz32', 'original', w & 31)
+        elif w & 0xff000010 == 0x54000000: ref('cond', 'original', w & 15)
+        else: emit(w)
+    label('guard')
+    emit(STP_PRE(9, 10, 31, -48)); emit(STP(11, 12, 31, 16)); emit(STP(13, 14, 31, 32))
+    emit(LDRX(9, 21, 0x18 // 8)); ref('cbz64', 'reject', 9)
+    emit(0x79400000 | ((0x13c // 2) << 10) | (9 << 5) | 11)  # ldrh w11, [x9,#0x13c]
+    emit(LDRX(13, 9, 0x100 // 8)); ref('cbz64', 'reject', 13)
+    emit(0xcb000000 | (13 << 16) | (21 << 5) | 13)  # sub x13,x21,x13: exact pane offset
+    emit(0x7100001f | (9 << 10) | (11 << 5)); ref('cond', 'event', 0)
+    emit(0x7100001f | (12 << 10) | (11 << 5)); ref('cond', 'reject', 1)
+    emit(0xf100001f | ((2 * 0xb0) << 10) | (13 << 5)); ref('cond', 'reject', 1)
+    ref('adr', 'loading_names', 12); ref('b', 'table')
+    label('event')
+    for index in (1, 3, 5, 6, 8):
+        emit(0xf100001f | ((index * 0xb0) << 10) | (13 << 5)); ref('cond', 'event_names_ready', 0)
+    ref('b', 'reject')
+    label('event_names_ready'); ref('adr', 'event_names', 12)
+    label('table')
+    emit(LDRX(10, 9, 0xf8 // 8)); ref('cbz64', 'reject', 10)
+    emit(LDRX(10, 10, 0x20 // 8)); ref('cbz64', 'reject', 10)
+    emit(0x5280000e)  # mov w14,#0
+    label('pane_name')
+    emit(0xf8607800 | (14 << 16) | (10 << 5) | 13)  # ldr x13,[x10,x14,lsl#3]
+    ref('cbz64', 'reject', 13)
+    label('name_byte')
+    emit(0x38401400 | (13 << 5) | 16); emit(0x38401400 | (12 << 5) | 17)  # ldrb post-index +1
+    emit(0x6b00001f | (17 << 16) | (16 << 5)); ref('cond', 'reject', 1)
+    ref('cbnz32', 'name_byte', 16)
+    emit(ADDI(14, 14, 1)); emit(0x6b00001f | (11 << 16) | (14 << 5)); ref('cond', 'pane_name', 3)
+    ref('b', 'accept')
+    label('reject')
+    emit(LDP(11, 12, 31, 16)); emit(LDP(13, 14, 31, 32)); emit(LDP_POST(9, 10, 31, 48)); ref('b', 'original')
+    label('accept')
+    emit(LDP(11, 12, 31, 16)); emit(LDP(13, 14, 31, 32)); emit(LDP_POST(9, 10, 31, 48))
+    emit(ADRP(16, start + len(words) * 4, state)); emit(0xbd405e02); emit(0x4f829000)
+    label('original'); emit(0x3c884260); emit(B(start + len(words) * 4, back))
+    for name, names in zip(('event_names', 'loading_names'), SCREEN_FADE_LAYOUTS):
+        label(name); data = b''.join(x.encode('ascii') + b'\0' for x in names)
+        data += b'\0' * (-len(data) % 4)
+        for i in range(0, len(data), 4): emit(int.from_bytes(data[i:i + 4], 'little'))
+    for i, kind, target, value in refs:
+        pc, to = start + i * 4, labels[target]
+        delta = to - pc
+        assert -(1 << 20) <= delta < (1 << 20)
+        if kind == 'b': words[i] = B(pc, to)
+        elif kind == 'adr': words[i] = 0x10000000 | ((delta & 3) << 29) | (((delta >> 2) & 0x7ffff) << 5) | value
+        else:
+            assert delta % 4 == 0
+            base = {'cbz32': 0x34000000, 'cbz64': 0xb4000000, 'cbnz32': 0x35000000, 'cond': 0x54000000}[kind]
+            words[i] = base | (((delta >> 2) & 0x7ffff) << 5) | value
+    return words, labels
+
+
+def screen_shape(ctx):
+    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+    # Never emit a partial camera/target/HUD patch. The matcher may leave an
+    # individual "others" function absent on an unknown build; the launcher must
+    # require the capability below, not merely the profile's requested feature.
+    if any(ctx.others.get(key) is None for key in tuple(k for k, _, _ in SCREEN_SHAPE_SITES) + SCREEN_FADE_DEPENDENCIES):
+        return False
+    for key, off, orig in SCREEN_SHAPE_SITES:
+        fs_site(ctx.others[key] + off, orig)
+    def patch_height(site, orig_hex, state_off, kind, why):
+        fs_site(site, orig_hex)
+        start = here()
+        emit(int.from_bytes(bytes.fromhex(orig_hex), 'little'))
+        emit(ADRP(16, here(), FS_STATE_OFF))
+        emit(0xb9400210 | ((state_off // 4) << 10))   # ldr w16, [x16, #state_off]
+        if kind == 'hi32_4_3':
+            body = (0x340000b0,   # cbz w16, +20
+                    0x531e7610,   # lsl w16, w16, #2
+                    0x52800071,   # mov w17, #3
+                    0x1ad10a10,   # udiv w16, w16, w17
+                    0xb3607e08)   # bfi x8, x16, #32, #32
+        elif kind == 'hi32':
+            body = (0x34000050,   # cbz w16, +8
+                    0xb3607e08)   # bfi x8, x16, #32, #32
+        elif kind == 'w10':
+            body = (0x34000050,   # cbz w16, +8
+                    0x2a1003ea)   # mov w10, w16
+        elif kind == 'f32_w8':
+            body = (0x34000070,   # cbz w16, +12
+                    0x1e230200,   # ucvtf s0, w16 (s0 overwritten at site+4)
+                    0x1e260008)   # fmov w8, s0
+        for w in body: emit(w)
+        emit(B(here(), site + 4))
+        fs_put(site, [B(site, start)], why)
+
+    # All 1920x1080, 2560x1440, 1280x720, and 1080.0f height sites across InitializeGraphicsSystem, scene defaults, and display manager.
+    sites = [
+        ('graphics init',        0x204, '08b4c0f2', 0x48, 'hi32_4_3', 'swapchain height = host oh * 4 / 3'),
+        ('graphics init',        0x3c0, '8886e8f2', 0x50, 'hi32',     'virtual screen height = host layout height'),
+        ('scene app init',       0x168, '08b4c0f2', 0x48, 'hi32_4_3', 'scene app RT height (2560x1440 -> 2560 x oh*4/3)'),
+        ('scene app init',       0x174, '0887c0f2', 0x48, 'hi32',     'scene app RT height (1920x1080 -> 1920 x oh)'),
+        ('base scene defaults',  0x38c, '0887c0f2', 0x48, 'hi32',     'base scene full height (1920x1080 -> 1920 x oh)'),
+        ('base scene defaults',  0x39c, '085ac0f2', 0x4c, 'hi32',     'base scene layout height (1280x720 -> 1280 x lh)'),
+        ('display mgr defaults', 0x00c, '0a878052', 0x48, 'w10',      'display mgr table height (1080 -> oh)'),
+        ('base res read',        0x114, 'e890a852', 0x48, 'f32_w8',   'base res reference height (1080.0f -> (float)oh)'),
+        ('display target a',     0x044, '0887c0f2', 0x48, 'hi32',     'display target height a (1920x1080 -> 1920 x oh)'),
+        ('display target b',     0x110, '0887c0f2', 0x48, 'hi32',     'display target height b (1920x1080 -> 1920 x oh)'),
+        ('display target c',     0x130, '0887c0f2', 0x48, 'hi32',     'display target height c (1920x1080 -> 1920 x oh)'),
+    ]
+    for key, off, orig_hex, state_off, kind, why in sites:
+        fn = ctx.others.get(key)
+        if fn is not None: patch_height(fn + off, orig_hex, state_off, kind, why)
+
+    # Layout2 ortho projection builder: scales 16:9 canvas height (>= 1000 wide, e.g. 1920x1080 or 1280x720) by state +0x5c (k = (16/9) / aspect) so UI widgets keep 1:1 pixel aspect.
+    # At +0x208 (orig ldr q6, [sp, #0xa0]), x16/x17, v0..v3 and nzcv are free; stores updated {W, H'} back to [sp, #0xa0] for both ortho blocks (x19+0xbf0 and x19+0xca0).
+    ortho_fn = ctx.others.get('layout ortho')
+    if ortho_fn is not None:
+        ortho_site = ortho_fn + 0x208
+        fs_site(ortho_site, 'e62bc03d')   # ldr q6, [sp, #0xa0]
+        start = here()
+        emit(0x3dc02be6)
+        emit(ADRP(16, here(), FS_STATE_OFF))
+        for w in (0xb9404a11, 0x34000291, 0x52a88f51, 0x1e270222, 0x5e0404c0, 0x1e222000, 0x540001eb,
+                  0x5e0c04c1, 0x1e245002, 0x1e261003, 0x1e220800, 0x1e230822, 0x1e223800, 0x1e20c000,
+                  0x1e221002, 0x1e222000, 0x540000aa, 0xbd405e02, 0x1e220821, 0x6e0c0426, 0x3d802be6):
+            emit(w)
+        emit(B(here(), ortho_site + 4))
+        fs_put(ortho_site, [B(ortho_site, start)], 'Layout2 ortho canvas height scaled by (16/9) / aspect when screen aspect is active')
+
+    # Layout view draw (main+0x773b90): builds the screen-space OrthoProjection (-W/2..W/2, -H/2..H/2) at +0x398 (orig ldp s0, s1, [x0]) into the 0x90-byte UBO copied to Layout2.
+    # Scales 16:9 viewport height s1 (W >= 1000) by state +0x5c (k = (16/9) / aspect) so 2D HUD widgets render 1:1 without vertical stretch. x16/x17, s2..s4 and nzcv are free there.
+    vo_fn = ctx.others.get('layout view ortho')
+    if vo_fn is not None:
+        vo_site = vo_fn + 0x398
+        fs_site(vo_site, '0004402d')   # ldp s0, s1, [x0]
+        start = here()
+        emit(0x2d400400)
+        emit(ADRP(16, here(), FS_STATE_OFF))
+        for w in (0xb9404a11, 0x34000211, 0x52a88f51, 0x1e270222, 0x1e222000, 0x5400018b,
+                  0x1e245002, 0x1e261003, 0x1e220804, 0x1e230822, 0x1e223884, 0x1e20c084,
+                  0x1e221002, 0x1e222080, 0x5400006a, 0xbd405e02, 0x1e220821):
+            emit(w)
+        emit(B(here(), vo_site + 4))
+        fs_put(vo_site, [B(vo_site, start)], 'Layout view ortho height scaled by (16/9) / aspect when screen aspect is active')
+
+    # sead::PerspectiveProjection::doUpdateMatrixImpl_ (main+0x3485cc0): for ~16:9 projections (|aspect - 16/9| <= 0.01), divides aspect by k (to host r = 1920/oh) and widens fovyTan by k (when <= state +0x60 tol) for true Vert+ 3D.
+    proj_fn = ctx.others.get('perspective proj')
+    if proj_fn is not None:
+        proj_site = proj_fn
+        fs_site(proj_site, '0084552d')   # ldp s0, s1, [x0, #0xac]
+        start = here()
+        emit(0x2d558400)
+        emit(ADRP(16, here(), FS_STATE_OFF))
+        for w in (0xb9404a11, 0x34000231, 0xbd405e03, 0xbd406204, 0x5291c731, 0x72a7fc71, 0x1e270225, 0x1e253825,
+                  0x1e20c0a5, 0x529ae151, 0x72a78471, 0x1e270226, 0x1e2620a0, 0x540000ac, 0x1e231821, 0x1e2420a0,
+                  0x5400004c, 0x1e230800):
+            emit(w)
+        emit(B(here(), proj_site + 4))
+        fs_put(proj_site, [B(proj_site, start)], 'PerspectiveProjection aspect and Vert+ fovyTan scaled by (16/9) / aspect when screen aspect is active')
+
+    # The live scene camera bypasses sead::PerspectiveProjection. Its uniform
+    # writer loads the projection rows into q19..q22 here, before storing the
+    # projection and composing projection * view. Scale the entire Y row (so
+    # shifts/jitter scale too). Require a perspective W row and original 16:9
+    # focal coefficient ratio, which also prevents a second correction.
+    camera_site = ctx.others['scene camera writer'] + 0x1ec
+    start = here()
+    emit(ADRP(16, here(), FS_STATE_OFF))
+    for w in (
+        0xb9404a11, 0x340002d1,  # output height; Original bypass
+        0x5e1406c3, 0x1e3e1004, 0x1e242060, 0x54000241,  # W.z == -1
+        0x5e1c06c3, 0x1e202068, 0x540001e1,  # W.w == 0
+        0x5e0c0683, 0x1e331863,  # Y.y / X.x
+        0x5291c731, 0x72a7fc71, 0x1e270224,  # 16:9
+        0x1e243863, 0x1e20c063, 0xbd406204, 0x1e242060, 0x540000a8,  # tolerance
+        0x1e2e1003, 0xbd405e04, 0x1e241863, 0x4f839294,  # Y row *= 1/k
+        0x1e214044,  # original fneg s4,s2; s3 is also overwritten next
+    ):
+        emit(w)
+    emit(B(here(), camera_site + 4))
+    fs_put(camera_site, [B(camera_site, start)], 'Expand live scene perspective before composing view-projection')
+
+    # Only the exact EventFade/LoadingFade layouts and their known fade panes
+    # may stretch. All movie/artwork layouts retain their original matrix.
+    calc_site = ctx.others['layout calc matrix'] + 0x19c
+    start = here()
+    words, _ = screen_fade_stub(start, FS_STATE_OFF, calc_site + 4)
+    for word in words: emit(word)
+    fs_put(calc_site, [B(calc_site, start)], 'Only verified EventFade/LoadingFade pane-name vectors and fade panes expand to cover the taller canvas')
+    ctx.capabilities.add('SCREEN_ASPECT')
+    return True
+
 def dynamic_resolution(ctx):
     here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
     site = ctx.others.get('dynamic resolution')
@@ -70,14 +304,35 @@ def dynamic_resolution(ctx):
     for w in drs_controller: emit(w)
     fs_put(site, [B(site, start)], 'dynamic resolution level: 0 (full resolution), or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level')
     ctx.capabilities.add('DYNAMIC_RESOLUTION')
+    screen_shape(ctx)
 
 MATCH_FRAME_STEP = {'main': [
     {'name': 'frame ratio from the host\'s step', 'size': 0x9b4, 'fingerprints': ['6ae2aff5344d14568e4dbaf93455e2d8278384bf892ed6c6eca87fef98fbcd1d'], 'stub': frame_step,   # v131072 main+0x6e6be0
      'others': {'dynamic resolution': {'size': 0x294, 'fingerprints': ['7af6ceb0aedf8e0c17dc08ce17fcd6a7cba6d394a0d09e3b504c6d668dc418e7']},   # v131072 main+0x8065e0
-                'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']}}},   # main+0x805aa0
+                'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']},   # main+0x805aa0
+                'graphics init': {'size': 0x570, 'fingerprints': ['f2c5558922a471ab585d374cc9293013d48da1562d43169367efdc8ea90a3fe8']},   # main+0x1202ce0
+                'scene app init': {'size': 0x273c, 'fingerprints': ['2227b93a9fa9dd0fd9aeb64359649df6e2ade519a8e47fa560f840efcdb5d7e7']},   # main+0x31f3890
+                'base scene defaults': {'size': 0x3cc, 'fingerprints': ['4d34ae0b1d0fa05603a24e64aae393040502bdfda2fc053a5c3c02ffda42053e']},   # main+0x108b300
+                'display mgr defaults': {'size': 0x4e0, 'fingerprints': ['871e4f9e24b2007d3a9ddbb061b6d1a3709c05f623b356daba35fe1dfeb2004c']},   # main+0x36b2bc0
+                'base res read': {'size': 0x1a0, 'fingerprints': ['c49c68fad34b6fce5c0dc0f519f5ddda261ad56778917dc2a711553a10cf4db1']},   # main+0xe82f30
+                'display target a': {'size': 0x58, 'fingerprints': ['125411e6b2df56ae4e8c0f9c16f134b4ed9247aca4e426c72b406b1f838bfbb9']},   # main+0xd565a0
+                'display target b': {'size': 0x1a8, 'fingerprints': ['212c9a344038bdcf99e4a462ecbe1bb58a2b6374d364debd0d0a0664e1dc1175']},   # main+0xebf370
+                'display target c': {'size': 0x188, 'fingerprints': ['0b669aaafc4c17cef5c96ac9e4054895152937e9c780f0c72893973256e9dca7']},   # main+0xf96310
+                'layout ortho': {'size': 0x7b0, 'fingerprints': ['fed0ce1f2ad6c8f6118a974ec7d5d5a346194a4c10a0fc01f894cfec3d0a1b68']},   # main+0x1520c80
+                'layout view ortho': {'size': 0x62c, 'fingerprints': ['103de33fb929cda858c2fbd57b726e6e1bca705bad66de872701819fbf5c6089']},   # main+0x773b90
+                'scene camera writer': {'size': 0x17f0, 'fingerprints': ['f598aeb712602ca2d905d3a5948778ad867f9e55890750c8da31c7bda2e2ac80']},  # main+0x6bc520
+                'perspective proj': {'size': 0xb8, 'fingerprints': ['e36f61aa83e94dfacc860ab4dd60dd1362cdab40fa490aee9e921a7ae0f3156d']},   # main+0x3485cc0
+                'layout pane name': {'size': 0x50, 'fingerprints': ['234e16050a7d75be6d09dca69fa91275eedca46d4b2db8d7c37e515b30e7e05f']},  # main+0x771cf0
+                'layout pane index': {'size': 0x1c, 'fingerprints': ['809b0ca9791bb000c6fea14fe867d49fe23dd0f797c18f5a54885b9b277943cd']},  # main+0x15276d0
+                'layout pane owner': {'size': 0xc, 'fingerprints': ['bc1e41d61182a468e79a4a2b4b2c247ce3611a4437bf014e3c918eb9bd147779']},  # main+0x43ace0
+                'layout pane enumeration': {'size': 0x4dc, 'fingerprints': ['18b95db27920b1e3949679edfaf7d82e7b5ba38aa3641c12a4fed50149bf7ee0']},  # main+0x43ad00
+                'layout calc matrix': {'size': 0x208, 'fingerprints': ['0e057804c3c8c7d14ff833983335d834e0bd7505e05263e9c065472b9d206c74']}}},   # main+0x14e9980
 ]}
 
 BINDING = [
+    {'what': 'screen shape: render heights, perspective, Layout2 projection and fullscreen fades (DM_SCREEN_ASPECT)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
+     'why': "all sixteen sites require their complete function fingerprints and original instruction bytes before any aspect stub is emitted; SCREEN_ASPECT capability is declared only for the complete patch; zero state preserves original instructions",
+     'checked': 'v131072 main e0f3ccfaf50065ae4ea01eb5aeb13b1a: original function fingerprints and instruction sites inspected read-only (2026-11-14); adapted from upstream PR2651 head1425a3fd; local active-aspect gameplay, HDR, frame generation and transition acceptance pending'},
     {'what': 'frame ratio from the host\'s step', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
      'why': "the game's own frame-ratio division, found by its function's fingerprint on any build that keeps the function",
      'checked': 'v131072 main: one function with this fingerprint, the site and its free registers read by disassembly (2026-11-08)'},

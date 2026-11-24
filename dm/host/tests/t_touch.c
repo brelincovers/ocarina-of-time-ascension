@@ -3,8 +3,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 typedef struct { uint32_t id; float x, y; } dm_touch;
 void dm_touch_set(const dm_touch *t, int n);
+void dm_touch_script(const dm_touch *t, int n);
+extern void (*_Atomic dm_touch_observer)(const dm_touch *t, int n);
+static int isolated, physical_observed;
+int dm_input_script_only(void) { return isolated; }
+static void observe_physical(const dm_touch *t, int n) { (void)t; physical_observed += n > 0; }
 int touch_fill(void *out, uint64_t now_ns);
 int touch_fill_n(void *out, int max, uint64_t now_ns, int points);
 static int fails, cases;
@@ -63,6 +69,16 @@ int main(void) {
         int r = touch_fill_n(got, 16, T0 + 283333339, 0); cases++;
         if (r != 0 || memcmp(got, exp, sizeof exp)) { fails++; printf("\u2717 console mode: an empty state numbered 18\n"); } else printf("\u2713 console mode: an empty state numbered 18\n"); }
     expect("handheld after console mode: number 19, the Start kept (640, 360)", T0 + 300000006, 19, 1, (want_pt[]){{16666667, 1, 6, 640, 360}});
+    dm_touch_set(NULL, 0); touch_fill((uint8_t[0x290]){0}, T0 + 316666673);
+    isolated = 1; atomic_store(&dm_touch_observer, observe_physical);
+    dm_touch_set(&f, 1);
+    expect("isolated physical touch is not applied", T0 + 333333340, 21, 0, NULL);
+    cases++; if (physical_observed != 1) { fails++; puts("physical observer did not receive ignored touch"); }
+    dm_touch_script(&f, 1); dm_touch_set(NULL, 0);
+    expect("scripted touch survives physical release", T0 + 350000007, 22, 1, (want_pt[]){{16666667, 1, 6, 640, 360}});
+    dm_touch_script(NULL, 0);
+    expect("scripted touch releases normally", T0 + 366666674, 23, 1, (want_pt[]){{16666667, 2, 6, 640, 360}});
+    expect("no stale physical touch after script release", T0 + 383333341, 24, 0, NULL);
     printf("== %d checks, %d failed ==\n", cases, fails);
     return fails != 0;
 }

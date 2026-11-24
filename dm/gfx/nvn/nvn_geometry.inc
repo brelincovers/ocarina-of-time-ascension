@@ -479,7 +479,7 @@ static id<MTLRenderPipelineState> geo_mesh_pso_for(NvProg *pr, id<MTLFunction> f
             NSError *e = nil; uint64_t t0 = bp_now();
             id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
             MLOG("%sgeometry mesh pipeline: vertex %s fragment %s kernel %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", vk, fk, gk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
-            os_unfair_lock_lock(&g_pso_mesh_lock); hm_put_id(&g_pso_mesh, &kk, p ?: NSNull.null); os_unfair_lock_unlock(&g_pso_mesh_lock);
+            os_unfair_lock_lock(&g_pso_mesh_lock); hm_put_id(&g_pso_mesh, &kk, (id)p ?: NSNull.null); os_unfair_lock_unlock(&g_pso_mesh_lock);
         });
         return nil;
     }
@@ -583,8 +583,7 @@ static int geo_mesh_take(id<MTL4RenderCommandEncoder> en) {
 }
 // The draw itself (draw() calls it with its pipeline, the vertex and fragment arguments and the pulling layout bound): the kernel's arguments, with vb_info
 // m0 = (0, 1 instance) and m1.x = the draw's triangles, and the draw's index source
-static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
-    id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_;
+static void geo_mesh_encode(id<MTL4RenderCommandEncoder> en) {
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];
     uint32_t tris = g_geo_mesh.a.count / 3;
     id<MTLBuffer> b; size_t o = arena_alloc(64, &b); uint8_t *p = (uint8_t *)b.contents + o;
@@ -617,6 +616,17 @@ static id<MTLFunction> mtk_nop_fragment(void) {
         fn = fn4_note([l newFunctionWithName:@"dm_mesh_nop"], l, @"dm_mesh_nop", nil); if (!fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
     return fn;
 }
+// Launch-latched experiment: the in-process pso_key does not contain these compiler hints.
+// The persistent Metal 4 arch_key DOES contain both flags, so hinted pipelines cannot
+// accidentally reuse an unhinted archive entry. Existing shader libraries stay compatible.
+static int mesh_tghint_enabled(void) {
+    static int enabled; static dispatch_once_t once;
+    dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_MESH_TGHINT"); enabled = e && !strcmp(e, "1");
+        if (enabled) MLOG("task / mesh SIMD-width hints on (DM_NVN_MESH_TGHINT=1; separate pipeline archive keys)"); });
+    return enabled;
+}
+static int mesh_tghint_threads(unsigned threads) { return threads && threads % 32 == 0; }
+static int mesh_tghint(NvShader *s) { return mesh_tghint_enabled() && s && mesh_tghint_threads(s->mesh_threads); }
 // The Metal 4 descriptor of a native mesh pipeline, whole: no base with open colour state, as a game has some hundred of them, each with functions of its own. Its depth / stencil
 // formats are not named (Metal 4 pipelines serve any). nil when a function has no Metal 4 descriptor (fn4_of: the diagnostic fragment overrides)
 static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *d, NvShader *ts, NvShader *ms, id<MTLFunction> ff, int border) {
@@ -625,6 +635,8 @@ static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *
     MTL4MeshRenderPipelineDescriptor *m = [MTL4MeshRenderPipelineDescriptor new];
     m.meshFunctionDescriptor = mf; m.fragmentFunctionDescriptor = f4; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
     m.objectFunctionDescriptor = of; m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;   // with no task: a block's first workgroup, one thread a block
+    m.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = mesh_tghint(ts);
+    m.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = mesh_tghint(ms);
     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageState = d.alphaToCoverageEnabled ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
     for (int i = 0; i < 8; i++) pso_col4(m.colorAttachments[i], d.colorAttachments[i]);
     return m;
@@ -636,6 +648,7 @@ static MTL4MeshRenderPipelineDescriptor *mtk_desc4(MTLRenderPipelineDescriptor *
 // compiles it whole, which the draw or the prewarm does not wait for. A pipeline written with other pipelines may sit in a plain file, which a compacting prewarm replaces, so one
 // taken from such a file then is captured again. Without the compiler, or for a function with no Metal 4 descriptor, only the MTLDevice build. *archived: taken from the archive
 static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, NSError **error, int *archived) {
+    pso_trace_reset();
     if (archived) *archived = 0;
     if (!k || !ms || !ms->fn || (!ts && !ms->mesh_obj)) return nil;
     MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, nil, 0);
@@ -645,7 +658,9 @@ static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvSh
     MTL4MeshRenderPipelineDescriptor *m4 = g_comp4 ? mtk_desc4(d, ts, ms, ff, k->border) : nil;
     if (m4) {
         id<MTLRenderPipelineState> ps = nil; int from_run = 0;
+        uint64_t start = pso_trace_on() ? bp_now() : 0;
         ps = arch_lookup(m4, 0, &from_run);   // a period of mesh pipelines alone is a p file (no vertex layout)
+        if (pso_trace_on()) { g_pso_trace.lookup_ns = bp_now() - start; g_pso_trace.archive_hit = ps != nil; g_pso_trace.archive_miss = !ps; }
         if (ps) {
             g_mtk_arch++; if (archived) *archived = 1;
             if (from_run && g_compact_enabled && atomic_load(&g_warm_running)) arch_harvest(m4, 1);
@@ -655,10 +670,14 @@ static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvSh
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
     m.meshFunction = fn_dev_b(ms->fn, !k->border); m.fragmentFunction = fn_dev_b(ff, !k->border); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
     m.objectFunction = ts ? fn_dev_b(ts->fn, !k->border) : fn_dev(ms->mesh_obj); m.payloadMemoryLength = ts ? (ts->mesh_payload + 15u) & ~15u : 16; m.maxTotalThreadsPerObjectThreadgroup = ts ? ts->mesh_threads : 1;
+    m.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = mesh_tghint(ts);
+    m.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = mesh_tghint(ms);
     m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
     for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
     m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+    uint64_t start = pso_trace_on() ? bp_now() : 0;
     id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:error];
+    if (pso_trace_on()) { g_pso_trace.compiled = 1; g_pso_trace.legacy = !m4; g_pso_trace.compile_ns = bp_now() - start; }
     if (ps) { if (m4) { g_mtk_built++; arch_harvest(m4, 0); } else g_mtk_dev++; }
     return ps;
 }
@@ -686,6 +705,7 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     uint64_t elapsed = bp_now() - start;
     g_bp_pso_n++; g_bp_pso_ns += elapsed;
     const char *task = ts ? ts->key : "-";
+    pso_trace_render(&k, ms, fs, 0, NULL, task, "draw", ps != nil, start, &g_pso_trace);
     if (!ps) {
         MLOG("[RED] task / mesh pipeline failed: task %s mesh %s fragment %s: %s", task, ms->key, fs ? fs->key : "-",
              error ? error.localizedDescription.UTF8String : "invalid depth/stencil formats");
@@ -745,6 +765,7 @@ static void mesh_scratch_bind(id<MTL4RenderCommandEncoder> en) {
 }
 static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     id<MTL4RenderCommandEncoder> en = (id<MTL4RenderCommandEncoder>)en_; NvShader *ts = g_mtk.ts, *ms = g_mtk.ms;
+    vis_draw_state(en);   // Ascension: a mesh draw owns its query state, not the previous ordinary draw's state
     [en setArgumentTable:g_vt atStages:MTLRenderStageMesh];
     if (ms->rf.mesh_spill) mesh_scratch_bind(en);
     uint64_t draw_gpu = g_mtk.ind_rec;

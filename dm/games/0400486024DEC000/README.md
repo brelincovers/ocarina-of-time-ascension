@@ -2,6 +2,40 @@
 
 A Switch 2 game: update v131072, SDK 22.2.8 (`Ounce`). Nintendo EPD's engine (sead, agl, gsys, Havok, CRIWARE; project `Owl`, with Tears of the Kingdom's file layout) on NVN2. Modules `main`, `subsdk0` (NintendoSDK_movie) and `sdk`, no rewriter patches. Status: plays on the Mac through the title, the opening, a new file's first scene, Link's house and Kokiri Forest, with saves, at about 59 fps with the picture close to console video. Mac only so far.
 
+## Ascension display aspect candidate (validation pending)
+
+The isolated `ascension-display-aspect-20261114` branch adds launch-time taller
+landscape rendering to exact main build `e0f3ccfaf50065ae4ea01eb5aeb13b1a`.
+All target, projection and layout sites must match before `SCREEN_ASPECT` is
+advertised in module fixups. Original 16:9 keeps the original instructions;
+Match derives height from the native usable game view, retains width and
+horizontal field of view, and preserves the selected graphics tier. Only
+identified full-layout fade resources may stretch; arbitrary artwork is excluded.
+Frame generation falls back at expanded aspect until its scalar camera inputs
+are verified. See [current candidate status](../../../docs/ascension-shared-state.md#display-aspect-candidate--2026-11-14)
+for build provenance and outstanding gameplay checks. No shader translation or
+pipeline-archive regeneration is required by these guest/host changes.
+
+## Ascension M1 Pro consolidation — 2026-11-13
+
+The upstream measurements below describe their stated hardware and builds;
+they are not Ascension performance claims. Ascension retains chain
+`8d9afacc48e2`, its existing native HDR/MetalFX/audio paths and all compatible
+shader/archive assets. The separately developed consolidation adds residency
+commit batching, correct native-mesh visibility state and optional bounded
+visibility-count suppression and task/mesh compiler hints. Family compression
+stays **Off**. These are host/profile changes, not a full shader rebuild.
+
+Focused fixtures pass after the documented test-harness repairs; real-game
+qualification remains pending. The walking slowdown was reproduced in the
+candidate, but its cause is unproven, and the first fixed-camera follow-up was
+invalidated by physical input and external termination. See the
+[release checkpoint](../../../docs/ascension-shared-state.md#release-consolidation-checkpoint--2026-11-13)
+for exact defaults, upstream references, test counts, failures and retained logs;
+see [visibility semantics](../../../docs/reference/rendering.md#samples-passed-counting-between-reports-and-resets)
+for the shared renderer change. Preserve installed apps, live saves and caches
+until a separate candidate passes gameplay qualification.
+
 ## What it needs
 
 | Setting | Where | Why |
@@ -161,6 +195,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 - [Unused files had no one place in the build folder](../../../docs/reference/packing.md#unused-files-had-no-one-place-in-the-build-folder): its `run/pso_archive` held 13.9 GB, about 33,700 indexed pipelines against a prewarm of under 10,000; unused archive files and retired build files now go to `<id>_build/obsolete/`. Resolved in tests; this folder's first start after it not yet run.
 - [Old chains' compiles stayed in the one compile cache file](../../../docs/reference/packing.md#old-chains-compiles-stayed-in-the-one-compile-cache-file): its `cas.db` held 52 GB, 10.3 GB of it used by the current Mac library; each chain now has its own file, and the next build moves the old one to `obsolete/`. Resolved in tests; the move of this folder's cache not yet run.
 - [A reuse build spends a minute and a half on the c1 and uniform extent tables](../../../docs/reference/packing.md#a-reuse-build-spends-a-minute-and-a-half-on-the-c1-and-uniform-extent-tables): resolved, 95 s of every build that restored its 42,848 shaders from the compile cache, 6.5 s from the memo.
+- Ascension 2026-11-14: [dormant fallback pacing clock](../../../docs/reference/frame-rate.md#dormant-fallback-pacing-clock-runs-ahead-of-display-link-presents), narrow upstream host correction with a local 18-case CPU fixture; gameplay effect pending qualification. Shader chain and rendering policy unchanged.
 
 - [Draw passes that wait for each other again while images share memory](../../../docs/reference/frame-rate.md#draw-passes-that-wait-for-each-other-again-while-images-share-memory): resolved, `draw_barriers game` was off whenever family heaps existed, and fragment-only barriers forced full ones; M1 Max gameplay frame 23.4 → 21.7 ms.
 - [Single frames over the fit keep a longer hold](../../../docs/reference/frame-rate.md#single-frames-over-the-fit-keep-a-longer-hold): 20 fps for 24.5 s after an area load in windowed play, then 60 again; fixed in the frame step. The castle town market, at the edge of the fit, could still stay at 30 fps after its load: fixed by the next entry, not measured here since.
@@ -280,3 +315,15 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 - [dav1d decoded one frame at a time](../../../docs/reference/movies.md#dav1d-decoded-one-frame-at-a-time): resolved, the title movie's heavy packets on an M2 Pro; and the drain that must go to its end.
 - [`devicectl` copies a large RomFS image through the Mac's memory](../../../docs/reference/packing.md#devicectl-copies-a-large-romfs-image-through-the-macs-memory): the 26.2 GB image's pushes to an iPad filled a 16 GB Mac's swap and failed; now sent over AFC.
 - [`devicectl`'s `--remove-existing-content` empties the app's whole container](../../../docs/reference/packing.md#devicectls---remove-existing-content-empties-the-apps-whole-container): the first complete copy of the image, deleted by the DLC step after it.
+
+## Ascension M1 Pro candidate — 2026-11-13
+
+The isolated GPU/startup branch retains Quality1920x1080 to2560x1440, native
+HDR10, MetalFX reconstruction0.7 and zero additional sharpening. Its optional
+private-staging barrier removal passes byte-identical HDR fixtures; gameplay
+performance is unqualified. The restored prewarm list now has297 mesh rows:
+45 canonical states absent from our252-row baseline and copied user cache were
+validated against this shader map from [PR2550](https://github.com/seedds/nxnative/pull/2550).
+This does not require shader translation or archive regeneration. Runtime
+coverage/startup cost remain pending. See [current shared state](../../../docs/ascension-shared-state.md#current-isolated-gpustartup-pass--2026-11-13)
+for exact fixtures, limitations and the bounded isolated comparison workflow.

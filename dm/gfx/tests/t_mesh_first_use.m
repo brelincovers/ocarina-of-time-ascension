@@ -70,7 +70,8 @@ int main(void) { @autoreleasepool {
     P(nvnMemoryPoolBuilderSetStorage)(&pb, memory, 65536); P(nvnMemoryPoolBuilderSetFlags)(&pb, 0x24);
     require(P(nvnMemoryPoolInitialize)(&pool, &pb), "command memory pool initialized");
     NVNcommandBuffer command; require(P(nvnCommandBufferInitialize)(&command, &device), "command buffer initialized");
-    P(nvnCommandBufferAddCommandMemory)(&command, &pool, 0, 65536);
+    P(nvnCommandBufferAddCommandMemory)(&command, &pool, 0, 65536 - 64);
+    uint64_t *query = (uint64_t *)(memory + 65536 - 32);
     typedef void (*DrawMeshTasks)(NVNcommandBuffer *, int, int);
     DrawMeshTasks draw = (DrawMeshTasks)nvn_lookup("nvnCommandBufferDrawMeshTasks"); require(draw != NULL, "native DrawMeshTasks entry point exists");
     enum { W = 8, H = 8 };
@@ -82,6 +83,7 @@ int main(void) { @autoreleasepool {
     const NVNtexture *colors[] = {(const NVNtexture *)&color}; const float viewport[] = {0, 0, W, H}, blue[] = {0, 0, 1, 1};
     for (int kind = 0; kind < 4; kind++) for (int pass = 0; pass < 2; pass++) {
         printf("%s, %s pipeline\n", kind == 0 ? "mesh only" : kind == 1 ? "task and mesh" : kind == 2 ? "depth only" : "ordinary vertex", pass ? "cached" : "first use");
+        query[0] = UINT64_MAX; query[1] = 0;
         P(nvnCommandBufferBeginRecording)(&command);
         P(nvnCommandBufferSetRenderTargets)(&command, kind == 2 ? 0 : 1, colors, NULL, (const NVNtexture *)&depth, NULL);
         P(nvnCommandBufferSetViewports)(&command, 0, 1, viewport); P(nvnCommandBufferSetScissor)(&command, 0, 0, W, H);
@@ -89,10 +91,13 @@ int main(void) { @autoreleasepool {
         P(nvnCommandBufferClearDepthStencil)(&command, 1, 1, 0, 0);
         if (kind != 2) P(nvnCommandBufferClearColor)(&command, 0, blue, 15);
         P(nvnCommandBufferBindProgram)(&command, (const NVNprogram *)&programs[kind], 0xc3);
+        P(nvnCommandBufferResetCounter)(&command, NVN_COUNTER_TYPE_SAMPLES_PASSED);
         if (kind == 3) P(nvnCommandBufferDrawArrays)(&command, NVN_DRAW_PRIMITIVE_TRIANGLES, pass * 3, 3);
         else draw(&command, pass + 1, 1);
+        P(nvnCommandBufferReportCounter)(&command, NVN_COUNTER_TYPE_SAMPLES_PASSED, (NVNbufferAddress)(uintptr_t)query);
         NVNcommandHandle handle = P(nvnCommandBufferEndRecording)(&command);
         P(nvnQueueSubmitCommands)(&queue, 1, &handle); P(nvnQueueFinish)(&queue);
+        CHECK(query[0] == W * H, "first/cached native task, mesh, depth-only and vertex draws report their own passed samples");
         id<MTLBuffer> pixels = [g_dev newBufferWithLength:W * H * 8 options:MTLResourceStorageModeShared]; res_add(pixels);
         mtl_sub_begin();
         enc_b_copy_texture_buffer(blit(), tex_mtl(&depth), 0, 0, MTLOriginMake(0,0,0), MTLSizeMake(W,H,1), pixels, 0, W * 4, W * H * 4);

@@ -1712,6 +1712,33 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** on the change's first version (a separate mode for games that never reset; the same values for them), Red Dead Redemption 1.0.4 (Apple M4, macOS 27.0.1), a recorded replay out of the saloon in Armadillo: the distant characters have their bodies at frames 2,280–2,340, frame time unchanged at 33.3 ms, no `[RED]`; played by hand, the same.
 - **Found on:** Red Dead Redemption (`01007820196A6000`): `rage::CharacterVisQueries::TestVisiblity` takes each character's result from `GetOcclusionQueryData`, end − begin of two reports around its box (about 35 queries and 324 reports a frame, no reset), and puts a character at or below its threshold in the occluded list, which `renDrawBucketContainer::AddToDrawList` uses to drop its low-detail body.
 
+### Samples-passed counting between reports and resets
+
+- **Cause:** native task/mesh draws did not establish their own visibility mode,
+  so they could inherit the preceding ordinary draw's state or miss a query on
+  first use. Separately, counting draws whose samples are reset before any
+  report produces work with no observable counter result.
+- **Fix:** ordinary and native task/mesh draw paths share `vis_draw_state`,
+  including explicit disabling when counting is unnecessary. This correctness
+  fix applies regardless of the optional optimization. Adapted from
+  [PR #2574](https://github.com/seedds/nxnative/pull/2574), pinned
+  `3bce47fadf1f209e1268a1aec7a1389e80508a99`.
+- **Optional policy:** `DM_NVN_VIS_NEED=1` enables bounded lookahead from a
+  samples-passed report/reset; default `0` retains baseline all-draw counting.
+  Only a provable later reset before a report suppresses counting. The scanner
+  follows recorded calls, returns and jumps without dereferencing indirect draw
+  arguments; exhausted bounds, malformed records, deep call stacks and unknown
+  continuation boundaries retain counting. Deferred replay also retains it.
+  Existing running totals, completion ordering and query-buffer lifetime remain
+  unchanged.
+- **Check:** Ascension's `t_render_enable_queue` passes 58 checks including exact
+  report totals and rendered pixels with suppression Off/On. `t_mesh_first_use`
+  now checks a 64-sample query around each first/cached task+mesh, mesh-only,
+  depth-only and ordinary draw; its 72 checks pass with direct/threaded encoding
+  and task/mesh hints Off/On. `test_vis_need_scan.py` compiles the actual scanner
+  extracted from source and passes 20 ASan/UBSan cases. These fixtures establish
+  query/pixel correctness for those cases, not a measured gameplay speedup.
+
 ## Vulkan layer
 
 The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galaxy needed the additions below, each found from a red line or a screenshot on the route to the Star Festival.

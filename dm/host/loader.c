@@ -279,6 +279,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
         else if (!strcmp(key, "RENDER_SCALE")) m->render_scale_max = (uint32_t)v;
         else if (!strcmp(key, "STEP_MAX")) m->step_max = (uint32_t)v;
+        else if (!strcmp(key, "SCREEN_ASPECT")) m->screen_aspect = v == 1;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
@@ -322,35 +323,37 @@ static void read_layout(module_t *m, const char *dir) {
 uint8_t *dm_fps_state;
 int dm_fps_step_max;   // the largest step the stubs give the game (STEP_MAX in its fixups table; 0 = FSTEP_MAX): the frame step holds frames and pays back within it (hle_nvn.c)
 static const char *g_fps_mod;   // the module holding the state page (for the log)
+static int g_screen_aspect_capability;
 static float g_render_scale_max = 1.0f;   // the render-scale stub's largest scale (RENDER_SCALE in its fixups table; 1 for a stub that only lowers the game's size)
 static void install_fps_state(module_t *m) {
-    if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
+    if (m->fps_state_off + 0xa0 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
     dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; dm_fps_step_max = (int)m->step_max;
+    g_screen_aspect_capability = m->screen_aspect;
     if (m->render_scale_max > 1) g_render_scale_max = (float)m->render_scale_max;
 }
-// The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
-// DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
-void dm_fps_state_apply(void) {
+// Ocarina's optional projection/HUD patch is emitted only after every required
+// function fingerprint and site passes. An old module with a newer host must
+// never advertise this path. Existing other-title screen-shape stubs keep their
+// prior profile contract; only Ocarina has the new all-or-none capability today.
+int dm_screen_aspect_supported(void) {
+    if (!dm_fps_state) return 0;
+    return !strcmp(DM_GAME_ID, "0400486024DEC000") ? g_screen_aspect_capability : DM_GAME_SCREEN_ASPECT;
+}
+// Initialization only, before guest_main: macOS auto geometry is not available
+// until its actual native window/fullscreen transition finishes. Never mutate
+// these fields while guest targets/layouts may already exist.
+void dm_screen_aspect_apply(void) {
     if (!dm_fps_state) return;
-    const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
-    if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
-    float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
-    // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size): 1.0 keeps the game's own size
-    // and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or above for a stub that also raises it,
-    // Hades II's 3.0). Independent of the frame step: written at target 0 too
-    const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f, hi = g_render_scale_max;
-    if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.1f; keeping the game's size", rs, hi); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
-    memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
-    // The game's own dynamic resolution, for builds whose stubs read it (the DYNAMIC_RESOLUTION capability of a frame step stub: Ocarina of Time's level function): 1 lets it
-    // run, 0 (the default) holds full resolution. Builds without such a stub ignore the field
-    const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
-    if (dr && strcmp(dr, "0") && strcmp(dr, "1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution", dr);
-    memcpy(dm_fps_state + 0x40, &dyn, sizeof dyn);
+    memset(dm_fps_state + 0x48, 0, 0x54);
+    extern void mtl_present_screen(uint32_t w, uint32_t h);
+    mtl_present_screen(0, 0);
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9
     const char *as = getenv("DM_SCREEN_ASPECT");
-    if (as && *as && strcmp(as, "0") && strcmp(as, "auto")) {   // 0: 16:9; auto: the iOS front end resolves it to the screen's shape (a Mac window has none)
+    // 0: Original; auto is resolved by the front end before guest execution.
+    if (as && *as && strcmp(as, "0") && strcmp(as, "auto")) {
+        if (!dm_screen_aspect_supported()) { LOG("screen shape: requested %s, effective Original 16:9: this game module has no verified aspect patch", as); return; }
         char *end; float a = strtof(as, &end);
         if (end == as || *end || !(a >= 1.3f && a < 1.77f)) LOG("[RED] DM_SCREEN_ASPECT=%s: a width / height from 1.3 to 1.77; keeping 16:9", as);
         else {
@@ -382,6 +385,26 @@ void dm_fps_state_apply(void) {
             LOG("%s: screen shape %.3f: output 1920x%u, layout 1280x%u (DM_SCREEN_ASPECT; only builds with screen-shape stubs follow it)", g_fps_mod, a, oh, lh);
         }
     }
+}
+// The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
+// DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
+void dm_fps_state_apply(void) {
+    if (!dm_fps_state) return;
+    const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
+    if (t != 0 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 30 or 60; using the game's own frame step", e); t = 0; }
+    float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
+    // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880, Hades II's render size): 1.0 keeps the game's own size
+    // and dynamic resolution; another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to the stub's largest scale: 1.0, or above for a stub that also raises it,
+    // Hades II's 3.0). Independent of the frame step: written at target 0 too
+    const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f, hi = g_render_scale_max;
+    if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.1f; keeping the game's size", rs, hi); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
+    memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+    // The game's own dynamic resolution, for builds whose stubs read it (the DYNAMIC_RESOLUTION capability of a frame step stub: Ocarina of Time's level function): 1 lets it
+    // run, 0 (the default) holds full resolution. Builds without such a stub ignore the field
+    const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
+    if (dr && strcmp(dr, "0") && strcmp(dr, "1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution", dr);
+    memcpy(dm_fps_state + 0x40, &dyn, sizeof dyn);
+    dm_screen_aspect_apply();
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
     LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
 }

@@ -120,6 +120,73 @@ def settings_rules(listed):   # DMSettings: what the launcher accepts as each se
     return rules
 
 
+RESONANCE_BUNDLE = 'org.nxnative.oot.resonance.fresh'
+ASCENSION_BUNDLE = 'org.nxnative.oot.ascension.rc'
+ASCENSION_PREFLIGHT_BUNDLE = 'org.nxnative.oot.ascension.preflight'
+ASCENSION_FINAL_BUNDLE = 'org.nxnative.oot.ascension.final'
+ASCENSION_FRAMEGEN_BUNDLE = 'org.nxnative.oot.ascension.framegen.hdr'
+ASCENSION_ASPECT_BUNDLE = 'org.nxnative.oot.ascension.framegen.aspect20261114'
+ASCENSION_LATEST_BUNDLE = 'org.nxnative.oot.ascension.framegen.latest20261115'   # Ascension on upstream 23790f8d: every Ascension launcher row, as the aspect build
+
+
+def launcher_settings(a):
+    data = json.loads(Path(a.settings).read_text(encoding='utf-8'))
+    if a.bundle_id in (RESONANCE_BUNDLE, ASCENSION_BUNDLE, ASCENSION_PREFLIGHT_BUNDLE, ASCENSION_FINAL_BUNDLE, ASCENSION_FRAMEGEN_BUNDLE, ASCENSION_ASPECT_BUNDLE, ASCENSION_LATEST_BUNDLE):
+        # Repackaging can use an already customized launcher.json as its input.
+        data['settings'] = [s for s in data['settings'] if s['env'] not in
+                            ('DM_EXPERIMENTAL_HDR', 'DM_PRESENT_SHARPEN')]
+        defaults = {'DM_FPS_TARGET': '30', 'DM_OPMODE': '1', 'DM_FULLSCREEN': '1'}
+        for setting in data['settings']:
+            if setting['env'] in defaults:
+                setting['default'] = defaults[setting['env']]
+        data['settings'].insert(3, {'env': 'DM_EXPERIMENTAL_HDR', 'kind': 'toggle',
+            'section': 'Game', 'label': 'HDR', 'default': '1', 'level': 'basic', 'on': '1', 'off': '0',
+            'note': 'Docked mode uses HDR on supported displays. Presentation MetalFX uses SDR.'})
+        data['settings'].append({'env': 'DM_PRESENT_SHARPEN', 'kind': 'range',
+            'section': 'Game', 'label': 'Extra sharpening', 'default': '0',
+            'min': 0, 'max': 1, 'step': 0.05, 'needs': 'DM_EXPERIMENTAL_HDR=0',
+            'note': 'Applies to SDR presentation. The default adds no sharpening.'})
+    if a.bundle_id in (ASCENSION_BUNDLE, ASCENSION_PREFLIGHT_BUNDLE, ASCENSION_FINAL_BUNDLE, ASCENSION_FRAMEGEN_BUNDLE, ASCENSION_ASPECT_BUNDLE, ASCENSION_LATEST_BUNDLE):
+        data['settings'] = [s for s in data['settings'] if s['env'] not in
+                            ('DM_UPSCALER', 'DM_DYNAMIC_RESOLUTION', 'DM_GFX_SCALE')]
+        data['settings'].insert(3, {'env': 'DM_GFX_SCALE', 'kind': 'choice',
+            'section': 'Game', 'label': 'Graphics quality', 'default': '0', 'level': 'basic',
+            'options': [['0', 'Quality'], ['1', 'Performance']],
+            'note': 'Independent of Docked or Handheld. Docked scene targets are 1920×1080 in Quality and 1536×864 in Performance. Applied at launch.'})
+        for setting in data['settings']:
+            if setting['env'] == 'DM_NVN_ENC_THREAD':
+                setting['default'] = '1'
+            if setting['env'] == 'DM_PRESENT_UPSCALE':
+                setting['label'] = 'Presentation upscaling (SDR)'
+                setting['needs'] = 'DM_EXPERIMENTAL_HDR=0'
+                setting['options'] = [['off', 'Standard'], ['metalfx', 'MetalFX Spatial']]
+    if a.bundle_id in (ASCENSION_FINAL_BUNDLE, ASCENSION_FRAMEGEN_BUNDLE, ASCENSION_ASPECT_BUNDLE, ASCENSION_LATEST_BUNDLE):
+        data['settings'] = [s for s in data['settings'] if s['env'] != 'DM_UPSCALER_SHARPNESS']
+        data['settings'].extend([
+            {'env': 'DM_UPSCALER', 'kind': 'choice', 'section': 'Game',
+             'label': 'Scene reconstruction', 'default': 'game', 'level': 'basic',
+             'options': [['game', 'Game’s own (NDSR)'], ['metalfx', 'MetalFX Spatial']],
+             'note': 'Applies to compatible scene passes. See Diagnostics for the effective scaler.'},
+            {'env': 'DM_UPSCALER_SHARPNESS', 'kind': 'range', 'section': 'Game',
+             'label': 'MetalFX reconstruction sharpness', 'default': '0.7',
+             'min': 0, 'max': 1, 'step': 0.05, 'needs': 'DM_UPSCALER=metalfx',
+             'note': 'Blends between the source and the reconstructed scene.'},
+        ])
+    if a.bundle_id in (ASCENSION_FRAMEGEN_BUNDLE, ASCENSION_ASPECT_BUNDLE, ASCENSION_LATEST_BUNDLE):
+        data['settings'] = [s for s in data['settings'] if s['env'] != 'DM_FRAMEGEN']
+        data['settings'].append({'env': 'DM_FRAMEGEN', 'kind': 'choice',
+            'section': 'Performance', 'label': 'Frame Generation (Experimental)',
+            'default': '0', 'level': 'basic', 'options': [['0', 'Off'], ['1', 'On']],
+            'note': 'Applied at launch. Requires MetalFX scene reconstruction, a validated colour path and measured display/GPU headroom. HDR uses the game’s own colour transform. Experimental; skips infeasible frames.'})
+    if a.bundle_id in (ASCENSION_ASPECT_BUNDLE, ASCENSION_LATEST_BUNDLE):
+        data['settings'] = [s for s in data['settings'] if s['env'] != 'DM_SCREEN_ASPECT']
+        data['settings'].append({'env': 'DM_SCREEN_ASPECT', 'kind': 'choice',
+            'section': 'Game', 'label': 'Aspect Ratio', 'default': '0', 'level': 'basic',
+            'options': [['0', 'Original 16:9'], ['auto', 'Match Display / Window']],
+            'note': 'Uses the unobscured game window at launch. Supported taller shapes show more above and below; target dimensions are rounded by the game. Unsupported shapes retain Original 16:9. Relaunch after resizing or switching displays to match the new shape. Frame Generation remains inactive at expanded aspect until its camera inputs are verified.'})
+    return data
+
+
 def info_plist(a, minos, icon):
     # LSSupportsGameMode off: macOS's Game Mode holds the GPU at its lowest clock while it is busy (docs/reference/frame-rate.md, macOS Game Mode holds the GPU at its lowest clock)
     p = {'CFBundleName': a.name, 'CFBundleDisplayName': a.name, 'CFBundleIdentifier': a.bundle_id or f'org.nxnative.{a.title_id.lower()}',
@@ -127,9 +194,13 @@ def info_plist(a, minos, icon):
          'CFBundleInfoDictionaryVersion': '6.0', 'LSMinimumSystemVersion': minos, 'LSArchitecturePriority': ['arm64'], 'NSHighResolutionCapable': True,
          'NSBluetoothAlwaysUsageDescription': 'Connect Switch 2 Joy-Con and Pro Controllers over Bluetooth.',
          'LSApplicationCategoryType': a.category or 'public.app-category.games', 'LSSupportsGameMode': False, 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US', 'DMSaveSyncChoice': 1}
+    if a.bundle_id == RESONANCE_BUNDLE:
+        p.update(DMSaveSyncChoice=False, CFBundleShortVersionString='0.5', CFBundleVersion='5', LSSupportsGameMode=True)
+    if a.bundle_id in (ASCENSION_BUNDLE, ASCENSION_PREFLIGHT_BUNDLE, ASCENSION_FINAL_BUNDLE, ASCENSION_FRAMEGEN_BUNDLE, ASCENSION_ASPECT_BUNDLE, ASCENSION_LATEST_BUNDLE):
+        p.update(DMSaveSyncChoice=False, CFBundleShortVersionString='1.0', CFBundleVersion='1', LSSupportsGameMode=True)
     if icon: p['CFBundleIconFile'] = 'AppIcon'
     if a.settings:
-        listed = json.loads(Path(a.settings).read_text(encoding='utf-8'))['settings']
+        listed = launcher_settings(a)['settings']
         p['DMSettings'] = settings_rules(listed)
         lang = next((s['default'] for s in listed if s['env'] == 'DM_LANG'), None)
         if lang: p['DMLanguage'] = lang   # the Game language row's default: --lang, or the game's first language when it lacks that one (settings.py), with or without the window
@@ -364,7 +435,8 @@ def pack(a):
     if pairs: shutil.copyfile(pairs, dm / 'pso_pairs.tsv')   # the split's copy, for a profile without the table
     if fonts: copy(fonts, dm / 'font', False)
     if a.env_file: shutil.copyfile(a.env_file, dm / 'env.txt')
-    if a.settings: shutil.copyfile(a.settings, dm / 'launcher.json')
+    if a.settings:
+        (dm / 'launcher.json').write_text(json.dumps(launcher_settings(a), ensure_ascii=False) + '\n', encoding='utf-8')
     if a.control_nacp: shutil.copyfile(a.control_nacp, res / 'control.nacp')
     msl_dst = res / 'msl' / (a.msl_name or msl.name)
     old_app = out if out.is_dir() else None

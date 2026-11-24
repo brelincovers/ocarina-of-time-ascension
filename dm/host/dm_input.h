@@ -13,6 +13,9 @@ enum {
 };
 #define DM_BTN_SHAKE (1ull << 63)   // not an NpadButton: the controller is shaken while set (its six-axis sensor, hle_hid.c); never reaches the game's buttons
 #define DM_STICK_MAX 32767
+// Test-only DM_INPUT_SCRIPT_ONLY=1, fixed at process start: guest input comes only
+// from DM_KEYS/DM_CTL. Native app controls and physical DM_REC observations stay live.
+int dm_input_script_only(void);
 void dm_input_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry);
 uint64_t dm_input_samples(void);   // Cumulative number of times the game has sampled the controller
 // The cheat VM's key mask (hle_cheats.c): every input source's button bits (0..15 in the enum above) ORed and the

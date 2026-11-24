@@ -848,3 +848,10 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
   - frame time unchanged (frame p50 33.2 ms, the game's 30 fps step), no red lines, the pictures right; GPU p50 16.65 → 15.65 ms, measured while another session ran a game on the same Mac, so not counted;
   - the submit thread standing on the deck (85–105 s, per-frame instructions fitted against draws a frame, at 2,180 draws): 73.93 → 73.06 M instructions a frame (−1.2 %), CPU p50 9.40 → 9.18 ms.
   - PR #2542's own run before PR #2482 (M4 Pro): 84,748 → 1,948 views made by frame 4,200.
+
+## Dormant fallback pacing clock runs ahead of display-link presents
+
+- **Symptom:** a long wait when the display link stops or times out after a long sequence of faster-than-clock presents.
+- **Cause:** stepping the fallback clock even when display-link ticks paced the frame accumulates a future target; the later clock fallback waits for the entire lead.
+- **Fix:** retain ordinary `nvn_pace` for frames actually paced by that clock, but use `nvn_pace_follow` to restart it at presents paced by the link or explicitly unpaced. This preserves legitimate multi-texture queue lead without a blanket clamp. Adapted from upstream `b010f2b83fda6f8e78174e7920d3d94b3d33c276`.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), upstream VRR observation; Ascension contains the same unconditional stepping. Local 18-case CPU regression fixture covers queued textures, 30/60 FPS, 18,000 link-paced frames, loss and recovery. Fresh build/test and gameplay results are recorded separately; no measured M1 Pro speedup is claimed by this source integration.

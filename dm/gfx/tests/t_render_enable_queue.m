@@ -196,6 +196,31 @@ int main(void) { @autoreleasepool {
     CHECK(r0[0]!=7 && r1[0]-r0[0]==W*H+W*H/2,"with no reset, end - begin of two reports counts the samples between them, across submissions");
     CHECK(r2[0]==W*H+W*H/2,"after a reset, the total counts the samples of every submission up to the report");
 
+    // Reset-discarded intervals may omit counting, but both later reports and
+    // the actual image must match the all-draw baseline in the same encoder.
+    int saved_vis_need_mode = g_vis_need_mode;
+    for (int mode = 0; mode < 2; mode++) {
+        g_vis_need_mode = mode; r0[0] = r1[0] = UINT64_MAX;
+        P(nvnCommandBufferBeginRecording)(&command);
+        P(nvnCommandBufferSetRenderTargets)(&command,1,colors,NULL,NULL,NULL);
+        P(nvnCommandBufferSetViewports)(&command,0,1,viewport); P(nvnCommandBufferSetScissor)(&command,0,0,W,H);
+        P(nvnCommandBufferBindProgram)(&command,&stable_green,3);
+        P(nvnCommandBufferResetCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED);
+        P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3); // discarded by next reset
+        P(nvnCommandBufferResetCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED);
+        P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
+        P(nvnCommandBufferReportCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED,(NVNbufferAddress)(uintptr_t)r0);
+        P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3); // discarded after a report
+        P(nvnCommandBufferResetCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED);
+        P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
+        P(nvnCommandBufferReportCounter)(&command,NVN_COUNTER_TYPE_SAMPLES_PASSED,(NVNbufferAddress)(uintptr_t)r1);
+        P(nvnCommandBufferCopyTextureToBuffer)(&command,&target,NULL,&region,output,0);
+        submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
+        CHECK(r0[0]==W*H && r1[0]==W*H,"dead intervals preserve both visible query reports with lookahead off/on");
+        CHECK(pixels(0,0,255,0),"dead query intervals still draw the identical green image");
+    }
+    g_vis_need_mode = saved_vis_need_mode;
+
     // Occlusion conditions: a samples-passed report that has landed decides the
     // block as the GPU would; one still in flight keeps the block drawing.
     uint64_t *empty=(uint64_t *)(memory+EVENT+256),*seen=(uint64_t *)(memory+EVENT+320);

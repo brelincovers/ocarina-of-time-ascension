@@ -33,6 +33,9 @@ __thread _Atomic int dm_host_work;   // defined by the graphics host in a full b
 static struct {
     AudioDeviceID device;
     Float64 rate;
+    unsigned hw_channels, input_ch;
+    AudioChannelLayoutTag hw_layout;
+    int fail_surround_once, keep_device_on_dispose;
     AudioValueRange range;
     UInt32 frames;
     AudioUnitPropertyListenerProc device_listener, format_listener;
@@ -64,7 +67,11 @@ static OSStatus mock_get(AudioUnit au, AudioUnitPropertyID id, AudioUnitScope sc
         assert(scope == kAudioUnitScope_Global && *size == sizeof unit.device); memcpy(data, &unit.device, *size);
     } else if (id == kAudioUnitProperty_StreamFormat) {
         assert(scope == kAudioUnitScope_Output && *size == sizeof(AudioStreamBasicDescription));
-        AudioStreamBasicDescription f = {.mSampleRate = unit.rate}; memcpy(data, &f, *size);
+        AudioStreamBasicDescription f = {.mSampleRate = unit.rate, .mChannelsPerFrame = unit.hw_channels}; memcpy(data, &f, *size);
+    } else if (id == kAudioUnitProperty_AudioChannelLayout) {
+        assert(scope == kAudioUnitScope_Output && *size >= sizeof(AudioChannelLayout));
+        AudioChannelLayout l = {.mChannelLayoutTag = unit.hw_layout};
+        memcpy(data, &l, sizeof l); *size = sizeof l;
     } else if (id == kAudioDevicePropertyBufferFrameSizeRange) {
         assert(scope == kAudioUnitScope_Global && *size == sizeof unit.range); memcpy(data, &unit.range, *size);
     } else {
@@ -83,8 +90,14 @@ static OSStatus mock_set(AudioUnit au, AudioUnitPropertyID id, AudioUnitScope sc
         changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0); // must not recursively set the same buffer
     } else if (id == kAudioUnitProperty_StreamFormat) {
         const AudioStreamBasicDescription *f = data;
-        assert(scope == kAudioUnitScope_Input && size == sizeof *f && f->mSampleRate == RATE && f->mChannelsPerFrame == 2);
+        assert(scope == kAudioUnitScope_Input && size == sizeof *f && f->mSampleRate == RATE &&
+               (f->mChannelsPerFrame == 2 || f->mChannelsPerFrame == 6));
+        unit.input_ch = f->mChannelsPerFrame;
         unit.input_formats++; changed(id, scope, el); // the 48 kHz guest format is not the hardware rate
+    } else if (id == kAudioUnitProperty_AudioChannelLayout) {
+        const AudioChannelLayout *l = data;
+        assert(scope == kAudioUnitScope_Input && size >= sizeof *l && unit.input_ch == 6 &&
+               l->mChannelLayoutTag == kAudioChannelLayoutTag_AudioUnit_5_1);
     } else {
         assert(id == kAudioUnitProperty_SetRenderCallback && scope == kAudioUnitScope_Input && size == sizeof(AURenderCallbackStruct));
     }
@@ -102,7 +115,13 @@ static OSStatus mock_remove(AudioUnit au, AudioUnitPropertyID id, AudioUnitPrope
     else { assert(id == kAudioUnitProperty_StreamFormat && unit.format_listener == cb); unit.format_listener = NULL; }
     return noErr;
 }
-static OSStatus mock_init(AudioUnit au) { assert(au == fake_au()); return unit.init_error; }
+static OSStatus mock_init(AudioUnit au) {
+    assert(au == fake_au());
+    if (unit.input_ch == 6 && unit.fail_surround_once) {
+        unit.fail_surround_once = 0; return kAudioUnitErr_FailedInitialization;
+    }
+    return unit.init_error;
+}
 static dispatch_semaphore_t start_entered, start_allowed, guest_returned, device_stopped, guest_closed, device_disposed;
 static OSStatus start_result;
 static OSStatus mock_start(AudioUnit au) {
@@ -119,7 +138,7 @@ static OSStatus mock_uninit(AudioUnit au) {
 }
 static OSStatus mock_dispose(AudioComponentInstance au) {
     assert(au == fake_au() && !unit.device_listener && !unit.format_listener);
-    unit.device = kAudioObjectUnknown;
+    if (!unit.keep_device_on_dispose) unit.device = kAudioObjectUnknown;
     changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
     unit.disposals++; if (device_disposed) dispatch_semaphore_signal(device_disposed); return noErr;
 }
@@ -222,6 +241,19 @@ static void blocked_start(void *out) {
     dispatch_release(start_entered);
 }
 
+// A HAL callback records the change; the watchdog applies it outside the HAL thread.
+static void refresh_after_change(aout *a, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitElement element) {
+    pthread_mutex_lock(&g_aos_lock);
+    unsigned before = unit.writes;
+    changed(id, scope, element);
+    assert(unit.writes == before);
+    au_route_refresh(a, now_ns());
+    // The mock delivers a synchronous format notification when the buffer size is set.
+    // Give the watchdog another tick to observe it before changing the mock device again.
+    au_route_refresh(a, now_ns());
+    pthread_mutex_unlock(&g_aos_lock);
+}
+
 int main(void) {
     setenv("DM_AUDIO", "1", 1); unsetenv("DM_DBG_AU_FRAMES");
     unit.device = 1; unit.rate = 48000; unit.range = (AudioValueRange){15, 4096}; unit.frames = 512;
@@ -231,34 +263,35 @@ int main(void) {
     check_open_publication = 0;
     assert(unit.frames == 240 && unit.writes == 1 && unit.input_formats == 1 && unit.device_listener && unit.format_listener);
 
+    aout *two = ao(out);
     unit.device = 2; unit.rate = 44100; unit.frames = 512;
-    changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
+    refresh_after_change(two, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
     assert(unit.frames == 221 && unit.writes == 2);
     // A device's rate can change without a CurrentDevice notification.
-    unit.rate = 96000; changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
+    unit.rate = 96000; refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
     assert(unit.frames == 480 && unit.writes == 3);
-    unit.rate = 48000; changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
+    unit.rate = 48000; refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
     assert(unit.frames == 240 && unit.writes == 4);
     unit.rate = 44100;
-    changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0);
-    changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1);
+    refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0);
+    refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1);
     assert(unit.frames == 240 && unit.writes == 4);
-    changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
+    refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
     assert(unit.frames == 221 && unit.writes == 5);
 
     // Device limits are part of the HAL contract. Request the nearest supported frame count.
     unit.device = 3; unit.rate = 48000; unit.range.mMinimum = 256;
-    changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
+    refresh_after_change(two, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
     assert(unit.frames == 256);
-    unit.range = (AudioValueRange){15, 128}; changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
+    unit.range = (AudioValueRange){15, 128}; refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
     assert(unit.frames == 128);
     unit.range.mMaximum = 4096;
     setenv("DM_DBG_AU_FRAMES", "1024", 1);
-    changed(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0); assert(unit.frames == 1024);
-    unit.device = 4; unit.rate = 44100; changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0); assert(unit.frames == 1024);
+    refresh_after_change(two, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0); assert(unit.frames == 1024);
+    unit.device = 4; unit.rate = 44100; refresh_after_change(two, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0); assert(unit.frames == 1024);
     unsetenv("DM_DBG_AU_FRAMES");
     unsigned before = unit.writes; unit.device = kAudioObjectUnknown;
-    changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0); assert(unit.writes == before);
+    refresh_after_change(two, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0); assert(unit.writes == before);
     unit.device = 1;
     blocked_start(out);
     assert(!object.key);
@@ -267,6 +300,43 @@ int main(void) {
     unit.device = 1; unit.rate = 48000; unit.init_error = kAudioUnitErr_FailedInitialization;
     aout failed = {.ch = 2};
     assert(au_create(&failed) == kAudioUnitErr_FailedInitialization && !failed.au && unit.disposals == 3);
-    puts("audio device: buffer configuration, blocked start, callback handoff, retry and lifecycle passed");
+    // Phase 3: a reported 5.1 layout is sufficient to try 6 channels, but
+    // initialization failure must start again with a brand-new stereo unit.
+    unit.init_error = 0; unit.device = 1; unit.hw_channels = 6;
+    unit.hw_layout = kAudioChannelLayoutTag_AudioUnit_5_1;
+    unit.fail_surround_once = 1; dm_audio_mode_set(DM_AUDIO_MODE_AUTO);
+    aout six = {.ch = 6, .id = 123};
+    atomic_init(&six.state, STATE_STOPPED);
+    assert(au_create(&six) == noErr && six.output_ch == 2 && six.au);
+    au_dispose(six.au); six.au = NULL; unit.device = 1;
+    assert(au_create(&six) == noErr && six.output_ch == 6 && six.au);
+    // A headphones or built-in-speaker switch is stereo, even with 5.1 enabled.
+    unit.keep_device_on_dispose = 1;
+    unit.hw_channels = 2; unit.device = 42;
+    changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
+    pthread_mutex_lock(&g_aos_lock);
+    au_route_refresh(&six, now_ns());
+    pthread_mutex_unlock(&g_aos_lock);
+    assert(six.au && six.output_ch == 2 && six.route_device == 42);
+
+    // Selecting a renderer must rebuild even when output stays at two channels.
+    dm_audio_mode_set(DM_AUDIO_MODE_BINAURAL);
+    refresh_after_change(&six, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
+    assert(six.output_ch == 2 && atomic_load(&six.binaural_active));
+    dm_audio_mode_set(DM_AUDIO_MODE_STEREO);
+    refresh_after_change(&six, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0);
+    assert(six.output_ch == 2 && !atomic_load(&six.binaural_active));
+    dm_audio_mode_set(DM_AUDIO_MODE_AUTO);
+    // Returning to the surround output restores six channels.
+    unit.hw_channels = 6; unit.device = 43;
+    changed(kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0);
+    pthread_mutex_lock(&g_aos_lock);
+    au_route_refresh(&six, now_ns());
+    pthread_mutex_unlock(&g_aos_lock);
+    assert(six.au && six.output_ch == 6 && six.route_device == 43);
+    au_dispose(six.au);
+    unit.keep_device_on_dispose = 0;
+    unsetenv("DM_AUDIO_51");
+    puts("audio device: buffer configuration, blocked start, fallback, surround route switching and lifecycle passed");
     return 0;
 }

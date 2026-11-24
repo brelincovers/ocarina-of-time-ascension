@@ -1,4 +1,5 @@
-// Periodic profiling closes at a frame boundary even when every frame is selected.
+// Profiling closes at the selected frame's present, not when round-robin NVN
+// queue replay temporarily visits a different frame. No Metal device is used.
 // Fake counter / event objects exercise production heap ownership without a GPU.
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
@@ -65,18 +66,29 @@ int main(void) { @autoreleasepool {
         CHECK(g_gp_state == 1 && g_gp_frame == frame && g_gp_n == 1, "a fresh sample belongs only to its selected frame");
         gp_begin(nil, 'C', nil); gp_end(nil);
         CHECK(g_gp_n == 2, "all encoders in the frame share its sample");
-        g_fence = frame * 10;
-        atomic_store(&g_cur_frame, frame + 1); gp_begin(nil, 'C', nil);
-        CHECK(g_gp_state == 2 && atomic_load(&g_gp_busy), "the next frame closes the prior sample even for every:1");
+        ProfileCompute *foreign = [ProfileCompute new];
+        atomic_store(&g_cur_frame, frame + 1); gp_begin(foreign, 'C', nil); gp_end(foreign);
+        CHECK(g_gp_state == 1 && !atomic_load(&g_gp_busy) && g_gp_n == 2 && !foreign.stamps,
+              "interleaved foreign-frame commands neither close nor contaminate the sample");
+        gp_present_finish(frame + 1);
+        CHECK(g_gp_state == 1 && !event.notification, "another frame's present cannot close the selected frame");
+        atomic_store(&g_cur_frame, frame); gp_begin(nil, 'C', nil); gp_end(nil);
+        CHECK(g_gp_n == 3, "selected-frame work after an interleaved queue is still sampled");
+        g_fence = frame * 10; gp_present_finish(frame);
+        CHECK(g_gp_state == 2 && atomic_load(&g_gp_busy), "the selected present closes the complete sample");
         CHECK(event.value == g_fence, "report waits for every committed segment of the sampled frame");
-        CHECK(g_gp_n == 2 && heap.invalidations == frame, "no following frame overwrites pending timestamps");
+        int registrations = event.registrations;
+        gp_present_finish(frame);
+        CHECK(event.registrations == registrations, "a repeated present cannot schedule a duplicate report");
+        atomic_store(&g_cur_frame, frame + 1); gp_begin(foreign, 'C', nil); gp_end(foreign);
+        CHECK(g_gp_n == 3 && heap.invalidations == frame && !foreign.stamps, "no following frame overwrites pending timestamps");
         [event complete];
         CHECK(!atomic_load(&g_gp_busy) && heap.resolutions == frame, "completion resolves the sampled frame once and releases the heap");
     }
-    // Sparse periodic selection also closes without waiting for a later unprofiled commit.
+    // Sparse selection also closes on present, even without later encoder work.
     g_gp_every = 5; g_gp_state = 0;
     atomic_store(&g_cur_frame, 5); gp_begin(nil, 'C', nil); gp_end(nil); g_fence = 50;
-    atomic_store(&g_cur_frame, 6); gp_begin(nil, 'C', nil); [event complete];
+    gp_present_finish(5); [event complete];
     CHECK(event.registrations == 4 && heap.resolutions == 4, "sparse and consecutive selection both report per frame");
     // An upload flush ending its own encoder inside a profiled draw pass (#531) leaves the pass's label alone; the pass's own end still stamps it.
     ProfileRender *pass = [ProfileRender new]; ProfileCompute *upload = [ProfileCompute new];
@@ -84,6 +96,19 @@ int main(void) { @autoreleasepool {
     atomic_store(&g_cur_frame, 10); gp_begin(pass, 'R', nil); int k = g_gp_cur;
     @try { gp_end(upload); } @catch (NSException *x) { CHECK(0, "another queue's encoder got the open pass's timestamp"); }
     CHECK(upload.stamps == 0 && g_gp_cur == k, "another queue's encoder does not close the open pass");
+    gp_present_finish(10);
+    CHECK(g_gp_state == 1 && !event.notification, "a present cannot report an encoder whose end timestamp is still pending");
     gp_end(pass); CHECK(pass.stamps == 2 && pass.last == 2 * (NSUInteger)k + 1 && g_gp_cur < 0, "the pass's own end writes its end stamp");
+    g_fence = 100; gp_present_finish(10); [event complete];
+    CHECK(event.value == 100, "the closed render pass reports at its committed fence");
+    // A fixed frame selection needs the same ownership rules as periodic mode.
+    g_gp_every = 0; g_gp_f0 = g_gp_f1 = 14; g_gp_state = 0;
+    atomic_store(&g_cur_frame, 13); gp_begin(nil, 'C', nil); CHECK(g_gp_state == 0, "fixed selection ignores earlier frames");
+    atomic_store(&g_cur_frame, 14); gp_begin(nil, 'C', nil); gp_end(nil);
+    atomic_store(&g_cur_frame, 15); gp_begin(upload, 'C', nil); gp_end(upload); gp_present_finish(15);
+    CHECK(g_gp_state == 1 && g_gp_n == 1 && !event.notification, "fixed selection survives a foreign frame and its present");
+    atomic_store(&g_cur_frame, 14); gp_begin(nil, 'C', nil); gp_end(nil); g_fence = 140;
+    gp_present_finish(14); [event complete];
+    CHECK(event.value == 140 && heap.resolutions == 6, "fixed selection reports all matching work on its own present");
     printf("t_gpuprof: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

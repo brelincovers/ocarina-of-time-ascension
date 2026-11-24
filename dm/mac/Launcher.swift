@@ -117,16 +117,257 @@ enum SaveCheck {
     }
 }
 
+private enum AscensionPage: String, CaseIterable {
+    case display = "Display", graphics = "Graphics", performance = "Performance", audio = "Audio", diagnostics = "Diagnostics"
+
+    var icon: String {
+        switch self {
+        case .display: return "display"
+        case .graphics: return "sparkles"
+        case .performance: return "speedometer"
+        case .audio: return "speaker.wave.2"
+        case .diagnostics: return "waveform.path.ecg"
+        }
+    }
+
+    static func page(for setting: Setting) -> Self {
+        switch setting.env {
+        case "DM_OPMODE", "DM_FULLSCREEN", "DM_EXPERIMENTAL_HDR", "DM_SCREEN_ASPECT": return .display
+        case "DM_GFX_SCALE", "DM_PRESENT_UPSCALE", "DM_PRESENT_SHARPEN", "DM_DYNAMIC_RESOLUTION", "DM_UPSCALER", "DM_UPSCALER_SHARPNESS": return .graphics
+        case "DM_FRAMEGEN", "DM_FPS_TARGET", "DM_PRESENT_SNAP", "DM_PSO_MTL4", "DM_PSO_PREBUILD", "DM_NVN_ENC_THREAD", "DM_FPS_HOLD": return .performance
+        default: return .diagnostics
+        }
+    }
+}
+
+private struct AscensionSidebar: NSViewRepresentable {
+    @Binding var page: AscensionPage
+
+    func makeCoordinator() -> Coordinator { Coordinator(page: $page) }
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let material = NSVisualEffectView()
+        material.material = .sidebar
+        material.blendingMode = .behindWindow
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let glass = NSGlassEffectView()
+        glass.cornerRadius = 16
+        glass.translatesAutoresizingMaskIntoConstraints = false
+        glass.contentView = stack
+        material.addSubview(glass)
+        NSLayoutConstraint.activate([
+            glass.leadingAnchor.constraint(equalTo: material.leadingAnchor, constant: 12),
+            glass.trailingAnchor.constraint(equalTo: material.trailingAnchor, constant: -12),
+            glass.topAnchor.constraint(equalTo: material.topAnchor, constant: 18),
+            stack.leadingAnchor.constraint(equalTo: glass.leadingAnchor, constant: 8),
+            stack.trailingAnchor.constraint(equalTo: glass.trailingAnchor, constant: -8),
+            stack.topAnchor.constraint(equalTo: glass.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: glass.bottomAnchor, constant: -8)
+        ])
+        for (index, page) in AscensionPage.allCases.enumerated() {
+            let button = NSButton(title: page.rawValue, target: context.coordinator, action: #selector(Coordinator.select(_:)))
+            button.image = NSImage(systemSymbolName: page.icon, accessibilityDescription: nil)
+            button.imagePosition = .imageLeading
+            button.bezelStyle = .recessed
+            button.setButtonType(.pushOnPushOff)
+            button.alignment = .left
+            button.tag = index
+            stack.addArrangedSubview(button)
+            button.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 30).isActive = true
+            context.coordinator.buttons.append(button)
+        }
+        return material
+    }
+
+    func updateNSView(_ view: NSVisualEffectView, context: Context) {
+        for (index, button) in context.coordinator.buttons.enumerated() {
+            button.state = AscensionPage.allCases[index] == page ? .on : .off
+        }
+    }
+
+    final class Coordinator: NSObject {
+        var buttons: [NSButton] = []
+        var page: Binding<AscensionPage>
+        init(page: Binding<AscensionPage>) { self.page = page }
+        @objc func select(_ sender: NSButton) {
+            page.wrappedValue = AscensionPage.allCases[sender.tag]
+            sender.state = .on
+        }
+    }
+}
+
+private func launcherAppearance(_ choice: String) -> NSAppearance? {
+    switch choice {
+    case "light": return NSAppearance(named: .aqua)
+    case "dark": return NSAppearance(named: .darkAqua)
+    default: return nil
+    }
+}
+
 struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let done: (Bool) -> Void
     let fit: (CGFloat) -> Void
     @AppStorage("window.show") private var show = true
+    @AppStorage("window.appearance") private var appearance = "system"
     @AppStorage("window.advanced") private var advanced = false
     @State private var checking = false
     @State private var check = 0   // which Play the running check is for: one the player went on from without it is dropped
 
+    @State private var page = AscensionPage.display
+    @AppStorage("DMSpatialAudioRouteV2") private var audioMode = 0
+    @AppStorage("DMSpeakerOutputPreference") private var speakerMode = 0
+    private var ascension: Bool { Bundle.main.bundleIdentifier?.hasPrefix("org.nxnative.oot.ascension.") == true }
+
     var body: some View {
+        if ascension { ascensionBody } else { legacyBody }
+    }
+
+    private var ascensionBody: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                AscensionSidebar(page: $page).frame(width: 172)
+                Divider()
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(spacing: 14) {
+                        Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 48, height: 48).accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Ascension").font(.title2.weight(.semibold))
+                            Text("Ocarina of Time · Apple Silicon Edition").foregroundStyle(.secondary)
+                        }
+                    }.padding(22)
+                    Divider()
+                    Form {
+                        Section {
+                            if page == .graphics, let tier = m.settings.first(where: { $0.env == "DM_GFX_SCALE" }) {
+                                preset(tier)
+                            }
+                            ForEach(m.settings.filter { AscensionPage.page(for: $0) == page && m.visible($0) && $0.env != "DM_GFX_SCALE" }) {
+                                SettingRow(s: $0, m: m)
+                            }
+                        } header: { Text(page.rawValue).accessibilityAddTraits(.isHeader) }
+                        availability
+                    }.formStyle(.grouped).id(page)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            }.frame(maxHeight: .infinity)
+            Divider()
+            HStack {
+                Toggle("Show this window at launch", isOn: $show).toggleStyle(.checkbox)
+                Spacer()
+                Button("Quit") { done(false) }
+                Button("Launch Game") { done(true) }
+                    .buttonStyle(.borderedProminent).controlSize(.large).keyboardShortcut(.defaultAction)
+            }.padding(16)
+        }
+        .onChange(of: appearance) { _, choice in
+            NSApp.keyWindow?.appearance = launcherAppearance(choice)
+        }
+    }
+
+    private func preset(_ setting: Setting) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Graphics quality").font(.headline)
+            HStack(spacing: 12) {
+                ForEach(setting.options ?? [], id: \.[0]) { option in
+                    let selected = m.values[setting.env] == option[0]
+                    Button {
+                        m.edit(setting, option[0])
+                    } label: {
+                        HStack {
+                            Image(systemName: option[0] == "1" ? "bolt.fill" : "sparkles")
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(option[1]).font(.headline)
+                                Text((option[0] == "1" ? "1536 × 864" : "1920 × 1080") +
+                                     (m.values["DM_SCREEN_ASPECT"] == "auto" ? " · 16:9 baseline" : " docked"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                            if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.accentColor) }
+                        }.padding(9).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityAddTraits(selected ? .isSelected : [])
+                    .disabled(m.fixed.contains(setting.env))
+                }
+            }
+            Text(m.fixed.contains(setting.env) ? "Graphics quality is set by a launch override." : "Applied at launch, independently of console mode.")
+                .font(.footnote).foregroundStyle(.secondary)
+            if m.values["DM_SCREEN_ASPECT"] == "auto" {
+                Text("Matching a taller window keeps the scene width and increases its height. At 16:10, docked Performance is 1536 × 960 and Quality is 1920 × 1200. More pixels may increase GPU time.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+        }.padding(.vertical, 4)
+    }
+
+    @ViewBuilder private var availability: some View {
+        switch page {
+        case .display:
+            let screen = NSApp.keyWindow?.screen ?? NSScreen.main
+            Section("Appearance") {
+                Picker("Appearance", selection: $appearance) {
+                    Text("System").tag("system")
+                    Text("Light").tag("light")
+                    Text("Dark").tag("dark")
+                }.pickerStyle(.segmented)
+            }
+            Section("Display status") {
+                LabeledContent("Launcher display", value: screen?.localizedName ?? "Unavailable")
+                if let screen {
+                    let mode = screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1
+                    LabeledContent("Display capability", value: mode ? "Extended dynamic range" : "Standard dynamic range")
+                }
+                LabeledContent("Effective output", value: "Reported by the game after launch")
+                if m.settings.contains(where: { $0.env == "DM_SCREEN_ASPECT" }) {
+                    Text("Match Display / Window uses the actual game window’s safe area, including native fullscreen. The effective picture shape is reported in Display and Diagnostics after launch. Resize changes take effect on the next launch.")
+                        .foregroundStyle(.secondary)
+                }
+                Text("HDR10 requires Docked mode and a compatible game display. Otherwise the game uses SDR.").foregroundStyle(.secondary)
+            }
+        case .graphics:
+            Section("Availability") {
+                Text("MetalFX Spatial is available for SDR presentation when the GPU and image size support it. Temporal reconstruction and SMAA are unavailable.")
+                    .foregroundStyle(.secondary)
+            }
+        case .audio:
+            Section("Game audio") {
+                Picker("Requested output", selection: Binding(get: { audioMode }, set: { mode in
+                    if (0...2).contains(mode) {
+                        speakerMode = mode
+                    } else if (0...2).contains(audioMode) {
+                        speakerMode = audioMode
+                    }
+                    audioMode = mode
+                })) {
+                    ForEach(Array(audioModes.enumerated()), id: \.offset) { index, label in
+                        Text(label).tag(index)
+                    }
+                }
+                Text("Change routing in the in-game Sound menu. Effective output, personalization and head tracking are reported there after playback starts.")
+                    .foregroundStyle(.secondary)
+                Text("Discrete 5.1 requires a verified output layout. AirPods head tracking requires a supported active route.")
+                    .foregroundStyle(.secondary)
+            }
+        case .diagnostics:
+            Section("Runtime status") {
+                Text("Frame timing and audio counters become available during gameplay. The Performance HUD can be enabled above.")
+                    .foregroundStyle(.secondary)
+                Button("Reset to tested defaults") { m.reset() }.disabled(!m.changed)
+            }
+        case .performance:
+            Section("Frame pacing") {
+                Text("The frame-rate target is a request. Enable the Performance HUD in Diagnostics to check actual pacing.").foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private let audioModes = ["Automatic", "Stereo", "Prefer discrete 5.1", "Fixed binaural", "Apple SpatialMixer fixed", "AirPods head tracking"]
+
+    private var legacyBody: some View {
         VStack(spacing: 0) {
             HStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 64, height: 64).accessibilityHidden(true)
@@ -139,7 +380,9 @@ struct LauncherView: View {
             .padding([.horizontal, .top], 20)
             Form {
                 settingSections(basic: true)
-                CloudSavesSection()
+                if (Bundle.main.object(forInfoDictionaryKey: "DMSaveSyncChoice") as? Bool) != false {
+                    CloudSavesSection()
+                }
                 Section {
                     DisclosureGroup("Advanced settings", isExpanded: $advanced) {}
                 }
@@ -263,11 +506,16 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
         app.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         app.addItem(withTitle: "Quit \(name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = app; menu.addItem(item); NSApp.mainMenu = menu
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 660), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        let ascension = Bundle.main.bundleIdentifier?.hasPrefix("org.nxnative.oot.ascension.") == true
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: ascension ? 810 : 560, height: ascension ? 610 : 660), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.title = name; w.isReleasedWhenClosed = false; w.delegate = self
-        w.contentMinSize = NSSize(width: 520, height: 0)
+        w.contentMinSize = ascension ? NSSize(width: 680, height: 460) : NSSize(width: 520, height: 0)
         window = w
-        if let screen = w.screen ?? NSScreen.main {
+        if ascension {
+            w.appearance = launcherAppearance(UserDefaults.standard.string(forKey: "window.appearance") ?? "system")
+            w.center()
+        }
+        else if let screen = w.screen ?? NSScreen.main {
             w.setFrameTopLeftPoint(NSPoint(x: screen.visibleFrame.midX - w.frame.width / 2, y: screen.visibleFrame.maxY))
         }
         let host = NSHostingView(rootView: LauncherView(m: model, done: { [weak self] in self?.finish($0) }, fit: { [weak self] in self?.fit($0) }))
@@ -311,6 +559,50 @@ enum LauncherWindowLayout {
 }
 
 // 1: Play (the window's settings are in the environment), 0: the player quit, 2: no window (no launcher.json, or "Show this window at launch" off): launcher.c applies the saved choices
+@_cdecl("dm_ascension_migrate_preferences")
+func migrateAscensionPreferences() {
+    guard let domain = Bundle.main.bundleIdentifier,
+          domain.hasPrefix("org.nxnative.oot.ascension.framegen") else { return }
+    let defaults = UserDefaults.standard
+    let marker = "ascension.preferencesMigrated.v1"
+    guard !defaults.bool(forKey: marker) else { return }
+    let allowed = Set(["window.appearance", "window.advanced", "window.show",
+                       "DMSpatialAudioRouteV2", "DMSpeakerOutputPreference",
+                       "DMShowFPS", "DMShowFPSOverlay"])
+    guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"),
+          let data = try? Data(contentsOf: url),
+          let file = try? JSONDecoder().decode(SettingsFile.self, from: data) else { return }
+    let settings = Dictionary(uniqueKeysWithValues: file.settings.map { ("launcher." + $0.env, $0) })
+    // A fresh consolidation candidate inherits the latest playable choices;
+    // only its own domain is written, and already-saved choices always win.
+    let priorDomains = domain == "org.nxnative.oot.ascension.framegen.aspect20261114"
+        ? ["org.nxnative.oot.ascension.framegen.final20261114", "org.nxnative.oot.ascension.framegen.finalcandidate",
+           "org.nxnative.oot.ascension.framegen.consolidation", "org.nxnative.oot.ascension.framegen.gpustartup",
+           "org.nxnative.oot.ascension.framegen.ultra", "org.nxnative.oot.ascension.release", "org.nxnative.oot.ascension.final"]
+        : domain == "org.nxnative.oot.ascension.framegen.final20261114"
+        ? ["org.nxnative.oot.ascension.framegen.finalcandidate", "org.nxnative.oot.ascension.framegen.consolidation",
+           "org.nxnative.oot.ascension.framegen.gpustartup", "org.nxnative.oot.ascension.framegen.ultra",
+           "org.nxnative.oot.ascension.release", "org.nxnative.oot.ascension.final"]
+        : domain == "org.nxnative.oot.ascension.framegen.finalcandidate"
+        ? ["org.nxnative.oot.ascension.framegen.consolidation", "org.nxnative.oot.ascension.framegen.gpustartup",
+           "org.nxnative.oot.ascension.framegen.ultra", "org.nxnative.oot.ascension.release", "org.nxnative.oot.ascension.final"]
+        : domain == "org.nxnative.oot.ascension.framegen.consolidation"
+        ? ["org.nxnative.oot.ascension.framegen.gpustartup", "org.nxnative.oot.ascension.framegen.ultra",
+           "org.nxnative.oot.ascension.release", "org.nxnative.oot.ascension.final"]
+        : ["org.nxnative.oot.ascension.release", "org.nxnative.oot.ascension.final"]
+    for oldDomain in priorDomains {
+        for (key, value) in defaults.persistentDomain(forName: oldDomain) ?? [:] {
+            guard defaults.object(forKey: key) == nil else { continue }
+            if let setting = settings[key], let value = value as? String, setting.accepts(value) {
+                defaults.set(value, forKey: key)
+            } else if allowed.contains(key) {
+                defaults.set(value, forKey: key)
+            }
+        }
+    }
+    defaults.set(true, forKey: marker)
+}
+
 @_cdecl("dm_mac_launcher")
 public func dmMacLauncher() -> Int32 {
     guard let url = Bundle.main.resourceURL?.appendingPathComponent("dm/launcher.json"), let data = try? Data(contentsOf: url) else { return 2 }

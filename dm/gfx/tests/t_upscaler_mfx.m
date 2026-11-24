@@ -92,7 +92,51 @@ static NvShader *upscaler(const char *key) {
     s->rf.b[1] = (nvn_rbind){.kind = NVN_RB_IMG, .dtt = MTLTextureType2D, .dpf = NVN_DPF_FLOAT, .reg = 1, .rw = 1};
     return s;
 }
-int main(void) { @autoreleasepool {
+// Exercise the production cache with stand-ins and a manually advanced fence.
+static int check_eviction(void) {
+    __weak id old_scaler, old_in, old_out, old_view;
+    @autoreleasepool {
+        g_fence = 41;
+        for (int i = 0; i < UP_MFX_SCALERS; i++) {
+            up_mfx_scaler *entry = &g_up_mfx[i];
+            entry->key[0] = 100 + i;
+            entry->used = ++g_up_mfx_use;
+        }
+        g_up_mfx[0].refused = 1;
+        CHECK(!up_mfx_scaler_for(100, 0, 0, 0, 0, 0, 0), "cached refusal is respected");
+        CHECK(g_up_mfx[0].used == g_up_mfx_use && g_up_mfx[0].used > g_up_mfx[UP_MFX_SCALERS - 1].used,
+              "a cached refusal refreshes recency");
+        up_mfx_scaler *victim = &g_up_mfx[1];
+        victim->sc = (id<MTL4FXSpatialScaler>)[NSObject new];
+        victim->in = (id<MTLTexture>)[NSObject new];
+        victim->out = (id<MTLTexture>)[NSObject new];
+        victim->read = (id<MTLTexture>)[NSObject new];
+        old_scaler = (NSObject *)victim->sc;
+        old_in = (NSObject *)victim->in;
+        old_out = (NSObject *)victim->out;
+        old_view = (NSObject *)victim->read;
+        CHECK(!up_mfx_scaler_for(200, 0, 0, 0, 0, 0, 0), "a failed allocation is recorded");
+        CHECK(victim->key[0] == 200 && g_up_mfx[0].key[0] == 100, "the least recently used entry is evicted");
+        CHECK(!victim->sc && !victim->in && !victim->out && !victim->read, "the replaced cache entry drops its references");
+        CHECK(g_deferred.count == 4, "the scaler, textures and distinct view are all deferred");
+        for (NvDeferredRelease *item in g_deferred) {
+            CHECK(item->fence == 42, "the object survives until the next submitted fence");
+            CHECK(item->keep_resident == (item->object == old_view), "only the view drops without retiring residency");
+        }
+        g_done = 41;
+        defer_drain();
+        CHECK(old_scaler && old_in && old_out && old_view, "no release before the completion fence");
+    }
+    g_done = 42;
+    @autoreleasepool { defer_drain(); }
+    CHECK(!old_scaler && !old_in && !old_out && !old_view, "all retired references are released after completion");
+    printf("MetalFX eviction: %d checks, %d failed\n", checks, failed);
+    return !!failed;
+}
+
+
+int main(int argc, char **argv) { @autoreleasepool {
+    if (argc == 2 && !strcmp(argv[1], "--check-eviction")) return check_eviction();
     mtl_init();
     const float enc[2] = {0.0031308f, 1 / 2.4f}, dec[2] = {0.04045f, 2.4f}, both[4] = {0.0031308f, 1 / 2.4f, 0.04045f, 2.4f}, dec16[3] = {0.040435791015625f, 2.3984375f, 0.07745361328125f}, enc16[1] = {0.41650390625f};
     float once[1] = {2.4f}; uint8_t rare[256] = {0}; memcpy(rare, once, 4);

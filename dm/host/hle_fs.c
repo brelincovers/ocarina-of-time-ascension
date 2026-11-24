@@ -5,6 +5,7 @@
 // Paths look like "rom:/data/x". FileHandle / DirectoryHandle are 8 bytes passed by value, here they store the host fd (FH_OUT) / DIR*.
 // Struct layout follows the public Horizon ABI: DirectoryEntry = {char name[0x301], pad[3], s8 type, pad[3], s64 size} (0x310 bytes).
 #include "hle.h"
+#include "stall_timing.h"
 #include <mach/mach.h>
 #include "front.h"
 #include <dirent.h>
@@ -1101,7 +1102,11 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     }
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
     while (got < sz) {
-        ssize_t r = pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
+        ssize_t r;
+        {
+            DM_STALL_SCOPE("synchronous pread", sz - got);
+            r = pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
+        }
         if (r < 0) { if (errno == EINTR) continue;
             // The graphics layer write-protects tracked pages again after each upload (nvn_dirty.c), so a page made writable above can be read-only again by the time pread
             // writes it: a plain write would fault into the tracker's handler, a system call gets EFAULT. Prepare the rest again (unprotect, mark dirty) and read on. Monster Train 2

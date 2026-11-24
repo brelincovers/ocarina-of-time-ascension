@@ -57,7 +57,7 @@ HOST_CONSTANTS = {'dm_border_off': (abi.BORDER_FC, True)}
 BATCH = 1000   # bases per metal-tt run: Odyssey's largest compiler lifetime footprint at this size was 2.065 GiB on an 8 GB M2
 MAX_FAILED = 8   # pipelines of one group metal-tt may fail on before the run counts as failed (compile_isolating)
 COMPUTE_BATCH = 16   # compute pipelines per metal-tt run, JOBS runs at a time: one metal-tt keeps about 2-3 cores busy: Star Fox's 233 took 268 s in 16 groups against 453 s in one run (M5 Pro, background priority, a loaded Mac)
-JOBS = max(1, (os.cpu_count() or 2) // 2)
+JOBS = max(1, int(os.environ.get("DM_PSO_JOBS", (os.cpu_count() or 2) // 2)))
 COLOUR = ('pixel_format', 'write_mask', 'blending_state', 'alpha_blend_operation', 'rgb_blend_operation', 'destination_alpha_blend_factor', 'destination_rgb_blend_factor',
           'source_alpha_blend_factor', 'source_rgb_blend_factor')
 

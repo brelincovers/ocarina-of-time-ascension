@@ -76,6 +76,7 @@ typedef struct {
     uint64_t unity_qs_ptr;     // Unity's QualitySettings (main's offset of the global pointer); the current level's vSyncCount, an int32, is at
     uint32_t unity_qs_idx, unity_qs_arr, unity_qs_size, unity_qs_vsync;   // [obj + arr] + (int32)[obj + idx] * size + vsync; 0 = none
     uint64_t fps_state_off;    // frame step state page (patch_nso.py FRAME_STEP: Tears of the Kingdom 1.4.3 and Breath of the Wild 1.9.0 main); 0 = none
+    uint32_t screen_aspect;   // SCREEN_ASPECT=1: complete verified game projection/HUD/target patch
     uint32_t step_max;         // the largest step the frame step stubs give the game (the fixups table's STEP_MAX, patch_nso.py ctx.step_max); 0 = FSTEP_MAX
     uint32_t render_scale_max; // a render-scale stub's largest scale (the fixups table's RENDER_SCALE, patch_nso.py): DM_RENDER_SCALE is held to it; 0 = no such stub
     int64_t patch_off;         // patch area relative to the base; negative = before the base (image too large, see patch_nso.py FAR), and size does not include it
@@ -233,3 +234,7 @@ void dm_gfx_shot_at(long k, const char *path);   // graphics side: screenshot of
 void dm_shot_written(const char *path, int ok);   // The graphics side finished writing a screenshot to disk (diag.c: DM_TICK_HOLD=E:SHOT unfreezes on this)
 void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg);   // The same, then(arg) in place of the last _exit(0) (oe::ExecuteProgram: execve of the next program)
 void dm_host_shutdown(const char *why);   // Graceful exit (hle_lifecycle.c): stop background threads and audio, stop the pipeline prewarm, drain graphics, write the pipeline archive, then _exit(0); used by SIGTERM and oe::ExecuteProgram
+
+// Initialize screen-shape state only before guest execution (native window auto resolution).
+int dm_screen_aspect_supported(void);
+void dm_screen_aspect_apply(void);

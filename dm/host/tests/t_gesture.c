@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdint.h>
 typedef struct { uint32_t id; float x, y; } dm_touch;
+int dm_input_script_only(void) { return 0; }   // default policy; touch isolation is exercised in t_touch
 void dm_touch_set(const dm_touch *t, int n);
 int gesture_fill(void *out, int n, uint64_t now_ns);
 typedef struct { int64_t samp, ctx; int32_t type, dir, x, y, dx, dy; float vx, vy; uint32_t attr; float scale, rot; int32_t npt, pt[4][2]; } gesture_state;

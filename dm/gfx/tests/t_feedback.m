@@ -35,7 +35,7 @@ static void sample(NvShader *fs, id<MTLRenderPipelineState> pipeline) {
     clear(MTLClearColorMake(0, 0, 0, 1));
     enc_r_pso(g_enc, pipeline);
     enc_r_viewport(g_enc, (MTLViewport){0, 0, 4, 4, 0, 1});
-    CHECK(encode_args((id<MTLCommandEncoder>)g_enc, fs, 1, 0), "production fragment arguments encoded");
+    CHECK(encode_args(g_enc, fs, 1, 0), "production fragment arguments encoded");
     enc_r_draw(g_enc, MTLPrimitiveTypeTriangle, 0, 3);
     rp_end();
 }

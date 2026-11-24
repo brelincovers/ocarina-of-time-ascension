@@ -41,6 +41,15 @@ static _Atomic uint64_t g_btn, g_axes, g_latch, g_sc_btn, g_sc_axes, g_sc_latch,
 static _Atomic uint64_t g_peek_latch;   // presses since the last dm_input_peek (the applet's reader)
 static _Atomic int g_hold;              // an applet holds the input (dm_input_hold)
 static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history entries below the newest keep positive sampling numbers
+// Explicit test-only process policy. Keep publishing/recording physical input:
+// suppress it only at guest-facing reads, leaving native app controls intact.
+static pthread_once_t g_script_only_once = PTHREAD_ONCE_INIT;
+static int g_script_only;
+static void script_only_init(void) {
+    const char *e = getenv("DM_INPUT_SCRIPT_ONLY"); g_script_only = e && !strcmp(e, "1");
+    if (g_script_only) LOG("DM_INPUT_SCRIPT_ONLY: guest receives scripted input only; physical DM_REC recording remains active; native app controls unchanged");
+}
+int dm_input_script_only(void) { pthread_once(&g_script_only_once, script_only_init); return g_script_only; }
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     return (uint64_t)(uint16_t)lx | (uint64_t)(uint16_t)ly << 16 | (uint64_t)(uint16_t)rx << 32 | (uint64_t)(uint16_t)ry << 48;
 }
@@ -51,7 +60,9 @@ static const uint64_t SHAKE_CYCLE_NS = (uint64_t)(1e9 / SHAKE_HZ);
 static _Atomic uint64_t g_shake_t0, g_shake_end;   // the current shake's start and end; end = UINT64_MAX while held
 static _Atomic int g_shake_on;
 static void shake_note(void) {
-    int on = ((atomic_load(&g_btn) | atomic_load(&g_sc_btn) | atomic_load(&g_pad_btn[0])) & DM_BTN_SHAKE) != 0;
+    uint64_t buttons = atomic_load(&g_sc_btn);
+    if (!dm_input_script_only()) buttons |= atomic_load(&g_btn) | atomic_load(&g_pad_btn[0]);
+    int on = (buttons & DM_BTN_SHAKE) != 0;
     if (atomic_exchange(&g_shake_on, on) == on) return;
     uint64_t t = guest_ns();
     if (on) { if (t >= atomic_load(&g_shake_end)) atomic_store(&g_shake_t0, t); atomic_store(&g_shake_end, UINT64_MAX); }
@@ -589,7 +600,8 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     s->sampling = atomic_fetch_add(&g_sampling, 1) + 1;
     npad_ref ref = npad_resolve(id);
     if (!(kind_style(ref, id) & style) || ref.pad < 0 || ref.pad >= DM_PLAYERS) return;   // no controller of this id / style: attributes = 0
-    if (ref.kind >= KIND_DUAL) { fill_joy(s, ref); return; }
+    int isolated = dm_input_script_only();
+    if (ref.kind >= KIND_DUAL && !isolated) { fill_joy(s, ref); return; }
     int pl = ref.pad;
     // Player 1: keyboard / touch, script, its controller and the players merged into it; another player: its own controller path
     uint32_t src = pl ? 1u << pl : 1u | merged_players();
@@ -603,8 +615,16 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
         b |= atomic_load(&g_pad_btn[p]) | atomic_exchange(&g_pad_latch[p], 0);
         uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(v, i));
     }
+    if (ref.kind >= KIND_DUAL) {   // isolated Joy-Cons: record their real state before discarding it
+        fill_joy(s, ref); b |= s->buttons;
+        int32_t joy[4] = {s->lx, s->ly, s->rx, s->ry};
+        for (int i = 0; i < 4; i++) a[i] = pick(a[i], joy[i]);
+    }
     if (!pl) {   // the physical sources so far (DM_REC records them, DM_BTN_SHAKE only from player 1's own controller and the keyboard, as shake_note), then the scripted path
         if (atomic_load_explicit(&g_rec_on, memory_order_relaxed)) rec_read((b & 0xffffull) | ((atomic_load(&g_btn) | atomic_load(&g_pad_btn[0])) & DM_BTN_SHAKE), a);
+    }
+    if (isolated) { b = 0; memset(a, 0, sizeof a); }   // latches above were consumed, not deferred to a later read
+    if (!pl) {
         b |= atomic_load(&g_sc_btn) | atomic_exchange(&g_sc_latch, 0);
         uint64_t c = atomic_load(&g_sc_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(c, i));
     }
@@ -620,7 +640,7 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     if (s->rx > STICK_THRESH) b |= 1u << 22;
     if (s->ry < -STICK_THRESH) b |= 1u << 23;
     s->buttons = b;
-    s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
+    if (ref.kind < KIND_DUAL) s->attributes = ATTR_CONNECTED | (id == NPAD_HANDHELD ? ATTR_WIRED | ATTR_LEFT_CONN | ATTR_LEFT_WIRED | ATTR_RIGHT_CONN | ATTR_RIGHT_WIRED : ATTR_LEFT_CONN | ATTR_RIGHT_CONN);
 }
 // The cheat VM's key mask (hle_cheats.c "all keys of the mask held"): the OR of every player's controller buttons
 // (the keyboard / touch source's bits included) plus the eight stick-direction pseudo buttons of the merged axes —
@@ -629,6 +649,10 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
 // the buttons 0..15 in NpadButton order and the sticks' directions 16..23; SL / SR (bits 24 / 25) can never fire, no
 // input source of this host reports them
 uint64_t dm_cheats_keys(void) {
+    if (dm_input_script_only()) {
+        uint64_t c = atomic_load(&g_sc_axes); int32_t a[4]; for (int i = 0; i < 4; i++) a[i] = ax(c, i);
+        return (atomic_load(&g_sc_btn) & 0xffffull) | stick_dirs(a);
+    }
     uint64_t b = 0; int32_t a[4] = {0};
     b |= atomic_load(&g_btn);
     for (int p = 0; p < DM_PLAYERS; p++) {
@@ -901,6 +925,7 @@ static uint64_t motion_copy(live_motion *m, motion_state *out) {   // a source's
 // DM_PHONE_MOTION says), with a copy of its state when out is given; NULL while none is fresh
 static live_motion *motion_pick(int p, motion_state *out) {
     if (p < 0 || p >= DM_PLAYERS) return NULL;
+    if (dm_input_script_only()) return NULL;   // Ascension: scripted qualification input has no live motion
     pthread_once(&g_motion_once, motion_env);
     if (!p && g_phone_mode > 0) return motion_copy(&g_phone_motion, out) ? &g_phone_motion : NULL;
     // Match the button path: in a one-player game, a controller in another slot also drives player 1.
@@ -919,6 +944,7 @@ static int motion_live(int p, motion_state *out) { return motion_pick(p, out) !=
 // Joy-Con 2 skipping reports, for any length of time), as the pad's merged stream holds the controller in another frame (a sideways Joy-Con's, a quarter turn away); else
 // the pad's merged one (a controller that reports no per-Joy-Con motion, or a Joy-Con not attached)
 static int joy_own(int p, int side) {   // 1: its own stream is fresh, 0: it went quiet, -1: none
+    if (dm_input_script_only()) return -1;   // Ascension: scripted input, no live motion
     pthread_once(&g_motion_once, motion_env); if (g_motion_off) return -1;
     if (motion_copy(&g_joy_motion[p][side], NULL)) return 1;
     return atomic_load(&g_joy_reported[p]) >> side & atomic_load(&g_joy_sides[p]) >> side & 1 ? 0 : -1;
@@ -1209,6 +1235,7 @@ static int jcms_target(uint32_t h, int *side) {
 static int jcms_log_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_JCMS_LOG"); on = e && atoi(e); } return on; }
 static int jcms_log_due(int kind) { static uint64_t last[8]; uint64_t t = now_ns(); if (!jcms_log_on() || kind < 0 || kind > 7 || t - last[kind] < 1000000000ull) return 0; last[kind] = t; return 1; }
 static int jcms_copy(JcmsState *out, int n, uint32_t h) {
+    if (dm_input_script_only()) return 0;
     int side, p = jcms_target(h, &side);
     if (p < 0 || !out || n <= 0) return 0;
     pthread_mutex_lock(&g_jcms_mu);
@@ -1505,6 +1532,7 @@ HLE_FORCE("_ZN2nn3hid24SetNmousePointerPositionENS0_12NmouseHandleEii", "mouse p
 typedef struct { int64_t unk0, sampling; int32_t x, y, dx, dy, wheel_x, wheel_y; uint32_t buttons, attributes; } NmouseState;
 _Static_assert(sizeof(NmouseState) == 48, "NmouseState");
 HLE_FORCE("_ZN2nn3hid14GetNmouseStateEPNS0_11NmouseStateENS0_12NmouseHandleE", "mouse state: a Joy-Con's pointer; none for the merged handle (no device)", bool, h_hid_NmouseState, void *out, uint64_t h) {
+    if (dm_input_script_only()) { if (out) memset(out, 0, sizeof(NmouseState)); return false; }
     int side, p = nmouse_of(h, &side);
     if (p < 0 && jcms_log_due(6)) LOG("hid nmouse: state %#llx: no device", (unsigned long long)h);
     if (p < 0 || !out) return false;

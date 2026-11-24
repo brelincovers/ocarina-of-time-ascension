@@ -22,12 +22,88 @@ void dm_vi_layer_crop(int c[4]) { memcpy(c, g_layer_crop, sizeof g_layer_crop); 
 #endif
 static int failed, cases;
 #define EXPECT(n, w, v) do { int a=(w),b=(v); cases++; printf("%s expected %d → got %d %s\n",n,a,b,a==b?"✓":"✗");failed+=a!=b; } while(0)
+#define EXPECT_NEAR(n, w, v) do { double a=(w),b=(v); int ok=fabs(a-b)<1e-9; cases++; printf("%s expected %.12g → got %.12g %s\n",n,a,b,ok?"✓":"✗");failed+=!ok; } while(0)
 static const uint8_t colors[4][4]={{255,0,0,255},{0,255,0,255},{0,0,255,255},{255,255,0,255}};
 #ifndef CROP_LEGACY_HEADER
 extern int g_shape_w,g_shape_h;   // t_host_stubs.c: the last shape the present reported to the front end
 #endif
 
 #ifndef CROP_LEGACY_HEADER
+static void check_viewport_geometry(void) {
+    MTLViewport vp=present_viewport(2560,1600,3024,1898);
+    EXPECT_NEAR("Match: image width",3024,vp.width);
+    EXPECT_NEAR("Match: image height",1890,vp.height);
+    EXPECT_NEAR("Match: left edge",0,vp.originX);
+    EXPECT_NEAR("Match: four-pixel top and bottom bars",4,vp.originY);
+    const double sizes[][4]={
+        {1952,900,2868,1320}, // nearly equal ratios must not stretch
+        {1920,1080,1919,1080}, {1920,1080,1365,863},
+        {1920,1080,2560,1440}, {1920,1080,3440,1440},
+        {1920,1080,1179,2556}, {2560,1600,303,191},
+        {2560,1600,301,200}, {2560,1600,201,301},
+    };
+    for(unsigned i=0;i<sizeof sizes/sizeof *sizes;i++) {
+        double pw=sizes[i][0],ph=sizes[i][1],dw=sizes[i][2],dh=sizes[i][3];
+        vp=present_viewport(pw,ph,dw,dh);
+        EXPECT_NEAR("same horizontal and vertical scale",vp.width/pw,vp.height/ph);
+        EXPECT_NEAR("horizontal centring",dw,2*vp.originX+vp.width);
+        EXPECT_NEAR("vertical centring",dh,2*vp.originY+vp.height);
+        EXPECT("viewport remains inside canvas",1,vp.originX>=-1e-9&&vp.originY>=-1e-9&&vp.width<=dw+1e-9&&vp.height<=dh+1e-9);
+        EXPECT("fitted picture reaches one canvas dimension",1,fabs(vp.width-dw)<1e-9||fabs(vp.height-dh)<1e-9);
+    }
+    vp=present_viewport(1920,1080,1365,863);
+    EXPECT_NEAR("odd resize retains fractional image height",767.8125,vp.height);
+    EXPECT_NEAR("odd resize centres fractional bars",47.59375,vp.originY);
+}
+
+// Check actual classic, Metal 4 and MetalFX presentation rasterisation, including
+// fractional viewports. The integer intervals below are independently specified
+// pixel-centre coverage; no viewport helper is used to calculate expected pixels.
+static void check_uniform_present(void) {
+    const int sw=64,sh=40;
+    MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:sw height:sh mipmapped:NO];
+    d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;
+    id<MTLTexture> src=[g_dev newTextureWithDescriptor:d];
+    uint8_t red[64*40*4];for(int i=0;i<sw*sh;i++)memcpy(red+4*i,colors[0],4);
+    [src replaceRegion:MTLRegionMake2D(0,0,sw,sh) mipmapLevel:0 withBytes:red bytesPerRow:sw*4];
+    res_add(src);res_commit();mtl_present_layer(16,10);mtl_present_screen(0,0);
+    int saved_fx=g_fx_mode;
+    const int sizes[][4]={{3024,1898,4,1894},{303,191,1,190},{301,200,6,194},{201,301,88,213}};
+    for(int mode=0;mode<3;mode++) {
+        if(mode&& !g_q4)continue;
+        if(mode==2&&![MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])continue;
+        g_fx_mode=mode==2;
+        for(unsigned i=0;i<sizeof sizes/sizeof *sizes;i++) {
+            int w=sizes[i][0],h=sizes[i][1],first=sizes[i][2],end=sizes[i][3];
+            d.width=w;d.height=h;d.usage=MTLTextureUsageRenderTarget;
+            id<MTLTexture> dst=[g_dev newTextureWithDescriptor:d];
+            if(mode)EXPECT("uniform Metal 4 present",mode==2?PRESENT_METALFX:PRESENT_STANDARD,present_offscreen_wait(src,NULL,dst));
+            else {
+                id<MTLCommandBuffer> cb=[g_q commandBuffer];
+                EXPECT("uniform classic present encodes",1,present_encode(cb,src,dst,NULL));
+                [cb commit];[cb waitUntilCompleted];
+                EXPECT("uniform classic present completes",MTLCommandBufferStatusCompleted,cb.status);
+            }
+            uint8_t *pixels=malloc(w*h*4);[dst getBytes:pixels bytesPerRow:w*4 fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+            int bad=0;
+            for(int y=0;y<h;y++)for(int x=0;x<w;x++) {
+                const uint8_t *p=pixels+4*(y*w+x);int r=y>=first&&y<end?255:0;
+                // Fractional Metal viewports can rasterize one boundary row
+                // differently from ideal pixel-centre coverage. Keep the
+                // integer MacBook case exact and check every interior pixel.
+                int fractional_edge = i != 0 && (y == first-1 || y == first || y == end-1 || y == end);
+                int red_ok = abs(p[0]-r)<=3 || (fractional_edge && (p[0]<=3 || p[0]>=252));
+                if (!red_ok || p[1]>3 || p[2]>3 || p[3]!=255) {
+                    if (bad == 0) printf("Unexpected pixel in %dx%d at %d,%d: %u,%u,%u,%u\n",w,h,x,y,p[0],p[1],p[2],p[3]);
+                    bad++;
+                }
+            }
+            EXPECT("uniform presentation preserves centred bars",0,bad);free(pixels);
+        }
+    }
+    g_fx_mode=saved_fx;mtl_present_layer(1,1);res_remove(src);
+}
+
 // Exercise the persistent scaler used by real presents, completing each command buffer before its allocator and output leave scope.
 static int check_present_resize(id<MTLTexture> src, int w, int h) {
     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
@@ -77,9 +153,95 @@ static uint64_t display_ticket(uint64_t receipt, uint64_t before) {
     return queued;
 }
 
-int main(void) { @autoreleasepool {
+#ifndef CROP_LEGACY_HEADER
+static void check_detail_and_hdr(void) {
+    const int width = 8;
+    uint8_t pixels[8 * 8 * 4];
+    for (int i = 0; i < width * width; i++) {
+        int value = i == 4 * width + 4 ? 144 : 128;
+        pixels[i * 4] = pixels[i * 4 + 1] = pixels[i * 4 + 2] = value;
+        pixels[i * 4 + 3] = 255;
+    }
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:width height:width mipmapped:NO];
+    desc.storageMode = MTLStorageModeShared;
+    desc.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> src = [g_dev newTextureWithDescriptor:desc];
+    MTLRegion region = MTLRegionMake2D(0, 0, width, width);
+    [src replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:width * 4];
+
+    desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    desc.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> dst = [g_dev newTextureWithDescriptor:desc];
+    id<MTLCommandBuffer> cb = [g_q commandBuffer];
+    EXPECT("SDR detail frame encodes", 1, present_encode(cb, src, dst, NULL));
+    [cb commit]; [cb waitUntilCompleted];
+    EXPECT("SDR detail frame completes", MTLCommandBufferStatusCompleted, cb.status);
+    [dst getBytes:pixels bytesPerRow:width * 4 fromRegion:region mipmapLevel:0];
+    int peak = pixels[(4 * width + 4) * 4];
+    int sharpen = present_sharpen_amount() > 0;
+    EXPECT("neutral edge response is bounded", 1, sharpen ? peak > 144 && peak <= 157 : peak == 144);
+    EXPECT("neutral flat areas are unchanged", 128, pixels[0]);
+
+    memset(pixels, 255, sizeof pixels);
+    [src replaceRegion:region mipmapLevel:0 withBytes:pixels bytesPerRow:width * 4];
+    desc.pixelFormat = MTLPixelFormatBGR10A2Unorm;
+    dst = [g_dev newTextureWithDescriptor:desc];
+    cb = [g_q commandBuffer];
+    EXPECT("HDR frame encodes", 1, present_encode(cb, src, dst, NULL));
+    [cb commit]; [cb waitUntilCompleted];
+    EXPECT("HDR frame completes", MTLCommandBufferStatusCompleted, cb.status);
+    uint32_t pq[8 * 8];
+    [dst getBytes:pq bytesPerRow:width * 4 fromRegion:region mipmapLevel:0];
+    EXPECT("SDR white maps to 203-nit PQ", 1, abs((int)(pq[0] & 1023) - 594) <= 2);
+    if (g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]) {
+        const NSUInteger size = 64, output = 128;
+        uint8_t white[64 * 64 * 4];
+        memset(white, 255, sizeof white);
+        desc.width = desc.height = size;
+        desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
+        desc.usage = MTLTextureUsageShaderRead;
+        src = [g_dev newTextureWithDescriptor:desc];
+        [src replaceRegion:MTLRegionMake2D(0, 0, size, size) mipmapLevel:0 withBytes:white bytesPerRow:size * 4];
+        res_add(src);
+        res_commit();
+        desc.width = desc.height = output;
+        desc.pixelFormat = MTLPixelFormatBGR10A2Unorm;
+        desc.usage = MTLTextureUsageRenderTarget;
+        dst = [g_dev newTextureWithDescriptor:desc];
+
+        g_fx_mode = 1;
+        unsetenv("DM_PRESENT_HDR_METALFX");
+        EXPECT("HDR presentation defaults to standard scaling", PRESENT_STANDARD, present_offscreen_wait(src, NULL, dst));
+        setenv("DM_PRESENT_HDR_METALFX", "1", 1);
+        EXPECT("SDR reconstruction and HDR composition both run", PRESENT_METALFX, present_offscreen_wait(src, NULL, dst));
+        uint32_t center;
+        [dst getBytes:&center bytesPerRow:4 fromRegion:MTLRegionMake2D(output / 2, output / 2, 1, 1) mipmapLevel:0];
+        EXPECT("Reconstructed white still maps to 203-nit PQ", 1, abs((int)(center & 1023) - 594) <= 2);
+        res_remove(src);
+    }
+}
+#endif
+
+int main(int argc, char **argv) { @autoreleasepool {
+#ifndef CROP_LEGACY_HEADER
+    check_viewport_geometry();
+    if(argc>1&&!strcmp(argv[1],"--viewport")) {
+        printf("== %d checks, %d failed ==\n",cases,failed);return failed!=0;
+    }
+#endif
     mtl_init();
 #ifndef CROP_LEGACY_HEADER
+    if(argc>1&&!strcmp(argv[1],"--viewport-gpu")) {
+        check_uniform_present();
+        printf("== %d checks, %d failed ==\n",cases,failed);return failed!=0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "--detail")) {
+        mtl_present_layer(1, 1);
+        check_detail_and_hdr();
+        printf("== %d checks, %d failed ==\n", cases, failed);
+        return failed ? 1 : 0;
+    }
     mtl_present_layer(1,1);   // square fixtures: a sized square layer, so the checks below see the crop's texels and the bars of that shape; the display's own shape is checked at the end
 #endif
     MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;
@@ -113,9 +275,9 @@ int main(void) { @autoreleasepool {
 #endif
 #ifndef CROP_LEGACY_HEADER
     {   // DM_PRESENT_UPSCALE: which content MetalFX scales, and to which size (the picture's rectangle on the canvas)
-        const struct { unsigned cw,ch,dw,dh,w,h; int upscale; } sizes[] = {
-            {1280,720,2868,1320,2347,1320,1},   // handheld, letterboxed on an iPhone
-            {1952,900,2868,1320,2868,1320,1},   // ratios within 1 % fill the canvas
+        const struct { unsigned cw,ch,dw,dh; double w,h; int upscale; } sizes[] = {
+            {1280,720,2868,1320,2346.6666666666665,1320,1},   // handheld, letterboxed on an iPhone
+            {1952,900,2868,1320,2862.9333333333334,1320,1},   // close ratios still preserve proportions
             {1280,720,2560,1440,2560,1440,1},   // Retina window
             {1280,720,1280,720,1280,720,0},     // native size
             {1600,900,1280,720,1280,720,0},     // downscale
@@ -124,7 +286,7 @@ int main(void) { @autoreleasepool {
         for (unsigned i=0;i<sizeof sizes/sizeof *sizes;i++) {
             MTLViewport vp=present_viewport(sizes[i].cw,sizes[i].ch,sizes[i].dw,sizes[i].dh);
             EXPECT("MetalFX only upscales the picture",sizes[i].upscale,fx_wanted(vp,sizes[i].cw,sizes[i].ch));
-            EXPECT("picture width",sizes[i].w,(int)vp.width);EXPECT("picture height",sizes[i].h,(int)vp.height);
+            EXPECT_NEAR("picture width",sizes[i].w,vp.width);EXPECT_NEAR("picture height",sizes[i].h,vp.height);
         }
         EXPECT("empty content is not upscaled",0,fx_wanted((MTLViewport){0,0,2868,1320,0,1},0,720));
     }

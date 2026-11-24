@@ -25,8 +25,15 @@ host_msl_force:
 FW=-framework Metal -framework MetalFX -framework Foundation -framework IOKit -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
 # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
 # Tests that #include nvn_mtl.m link the rest of the NVN layer beside it (hle_nvn.c: memory pools, sparse pools, serials) and the host's large stack, with weak stubs of what they need of the host (t_host_stubs.c)
-MTL_T_DEP=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+MTL_T_DEP=../../host/stall_timing.h ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 MTL_T_SRC=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX))
+t_rt_unbind: t_rt_unbind.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_unbind.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_rt_unbind
+check_t_rt_unbind: t_rt_unbind
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./t_rt_unbind
+	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./t_rt_unbind
+	MTL_DEBUG_LAYER=1 DM_NVN_UNBIND_DEFER=0 ./t_rt_unbind
 # The run list: every t_*.c and t_*.m but those in NOT_RUN. `make run` builds them all (in parallel with -j), then runs them one after another, each through its check_
 # target: ./t_x by default, with the environment its RUN_ENV gives it (check_t_x: RUN_ENV = MTL_DEBUG_LAYER=1, beside its build rule), or a check_t_x recipe of its own when it
 # runs several ways. A new test needs its source and its build rule; no list to add it to. NOT_RUN: helpers linked into other tests (t_host_stubs, t_present_rescue_focus, t_gpu_lost_front),
@@ -206,6 +213,9 @@ check_t_gmem_words: t_gmem_words
 t_pool_notes: t_pool_notes.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_notes.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 check_t_pool_notes: RUN_ENV = MTL_DEBUG_LAYER=1
+t_pool_replay: t_pool_replay.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_replay.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+check_t_pool_replay: RUN_ENV = MTL_DEBUG_LAYER=1
 t_htab_update: t_htab_update.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_htab_update.m $(MTL_T_SRC) $(FW)
 check_t_htab_update: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -225,6 +235,8 @@ check_t_present_crop: t_present_crop
 	DM_PRESENT_SNAP=0 DM_NVN_ENC_THREAD=1 ./t_present_crop
 	DM_PRESENT_SNAP=1 DM_NVN_ENC_THREAD=0 ./t_present_crop
 	DM_PRESENT_SNAP=1 DM_NVN_ENC_THREAD=1 ./t_present_crop
+	DM_PRESENT_SHARPEN=0 ./t_present_crop --detail
+	DM_PRESENT_SHARPEN=0.5 ./t_present_crop --detail
 t_present_rescue: t_present_rescue.m t_present_rescue_focus.c $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_present_rescue.m t_present_rescue_focus.c $(MTL_T_SRC) $(FW)
 .PHONY: check_t_present_rescue
@@ -258,6 +270,8 @@ check_t_present_snap: t_present_snap
 t_reorder_chain: t_reorder_chain.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_reorder_chain.m $(MTL_T_SRC) $(FW)
 check_t_reorder_chain: RUN_ENV = MTL_DEBUG_LAYER=1
+t_hdr_capture: t_hdr_capture.m ../nvn/nvn_hdr_capture.m ../nvn/nvn_hdr_capture.h
+	clang $(CFLAGS) -fobjc-arc -o $@ t_hdr_capture.m ../nvn/nvn_hdr_capture.m $(FW)
 t_ub: t_ub.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_ub.m $(MTL_T_SRC) $(FW)
 t_gpuprof: t_gpuprof.m $(MTL_T_DEP)
@@ -326,6 +340,8 @@ check_t_sbw: t_sbw
 	./t_sbw
 t_ubp_running: t_ubp_running.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_ubp_running.m $(MTL_T_SRC) $(FW)
+t_fg_camera: t_fg_camera.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_fg_camera.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_ubp_running
 check_t_ubp_running: t_ubp_running
 	./t_ubp_running
@@ -367,8 +383,16 @@ t_ubc_wait: t_ubc_wait.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_ubc_wait.m $(MTL_T_SRC) $(FW)
 t_pso_pending: t_pso_pending.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_pending.m $(MTL_T_SRC) $(FW)
+t_pso_look_wait: t_pso_look_wait.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_look_wait.m $(MTL_T_SRC) $(FW)
+check_t_pso_look_wait: RUN_ENV = MTL_DEBUG_LAYER=1
 t_shmap_warm: t_shmap_warm.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_shmap_warm.m $(MTL_T_SRC) $(FW)
+t_pso_bg_look: t_pso_bg_look.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_bg_look.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_pso_bg_look
+check_t_pso_bg_look: t_pso_bg_look
+	MTL_DEBUG_LAYER=1 ./t_pso_bg_look
 t_pso_depth_stencil: t_pso_depth_stencil.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_depth_stencil.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_pso_depth_stencil
@@ -435,6 +459,11 @@ check_t_view_levels: RUN_ENV = MTL_DEBUG_LAYER=1
 t_res_commit: t_res_commit.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_res_commit.m $(MTL_T_SRC) $(FW)
 check_t_res_commit: RUN_ENV = MTL_DEBUG_LAYER=1
+t_res_cb: t_res_cb.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_res_cb.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_res_cb
+check_t_res_cb: t_res_cb
+	@set -e; for enc in 0 1; do DM_NVN_ENC_THREAD=$$enc MTL_DEBUG_LAYER=1 ./t_res_cb; done
 t_upload_src: t_upload_src.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upload_src.m $(MTL_T_SRC) $(FW)
 check_t_upload_src: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -529,6 +558,10 @@ check_t_alias_takeover: RUN_ENV = MTL_DEBUG_LAYER=1
 # The resource owner alone: nvn_owner.m (and the texture layouts it sizes shared entries with) with this test's stand-ins for the replay layer's hooks, no nvn_mtl.m
 t_serial_owner: t_serial_owner.m ../nvn/nvn_owner.m ../nvn/nvn_owner.h ../nvn/nvn_tex.c ../nvn/nvn_tex.h ../nvn/nvn_hmap.h ../nvn/nvn_obj.h $(GAME_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_serial_owner.m ../nvn/nvn_owner.m ../nvn/nvn_tex.c -framework Metal -framework Foundation
+# Ownership census retains an identity snapshot while streaming owners change; CPU only.
+t_census_snapshot: t_census_snapshot.m ../nvn/nvn_census.h
+	clang $(CFLAGS) -fobjc-arc -o $@ t_census_snapshot.m -framework Foundation
+# Ghost retention uses NSObject stand-ins: both policies are checked without creating a Metal device.
 t_partial_upload: t_partial_upload.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_partial_upload.m $(MTL_T_SRC) $(FW)
 check_t_partial_upload: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -748,3 +781,30 @@ check_t_sparse_pool_cache: RUN_ENV = MTL_DEBUG_LAYER=1
 t_sparse_copy: t_sparse_copy.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_sparse_copy.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 check_t_sparse_copy: RUN_ENV = MTL_DEBUG_LAYER=1
+# Ascension's host-only frame generation policy and native HDR terminal transform.
+t_fg_policy: t_fg_policy.c ../nvn/nvn_fg_policy.h
+	clang -std=c11 -O1 -g -Wall -Wextra -Werror -pthread -o $@ $<
+t_framegen_color: t_framegen_color.m ../nvn/nvn_framegen_color.h
+	clang -O1 -g -Wall -Wextra -Werror -fobjc-arc -o $@ $< -framework Metal -framework Foundation
+
+t_fg_geometry: t_fg_geometry.c ../nvn/nvn_fg_geometry.inc
+	clang -std=c11 -O1 -g -Wall -Wextra -Werror -ffp-contract=off -o $@ $<
+
+
+# Launch-latched mesh/compiler hints; preserve the existing shader/archive chain.
+t_mesh_hint: t_mesh_hint.m t_mesh_first_use.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mesh_hint.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_mesh_hint
+check_t_mesh_hint: t_mesh_hint
+	DM_NVN_ENC_THREAD=0 DM_NVN_MESH_TGHINT=0 MTL_DEBUG_LAYER=1 ./t_mesh_hint
+	DM_NVN_ENC_THREAD=0 DM_NVN_MESH_TGHINT=1 MTL_DEBUG_LAYER=1 ./t_mesh_hint
+	DM_NVN_ENC_THREAD=1 DM_NVN_MESH_TGHINT=0 MTL_DEBUG_LAYER=1 ./t_mesh_hint
+	DM_NVN_ENC_THREAD=1 DM_NVN_MESH_TGHINT=1 MTL_DEBUG_LAYER=1 ./t_mesh_hint
+t_family_compression: t_family_compression.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_family_compression.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_family_compression
+check_t_family_compression: t_family_compression
+	DM_NVN_ENC_THREAD=0 DM_NVN_FAMILY_NOCOMPRESS=1 MTL_DEBUG_LAYER=1 ./t_family_compression
+	DM_NVN_ENC_THREAD=0 DM_NVN_FAMILY_NOCOMPRESS=0 MTL_DEBUG_LAYER=1 ./t_family_compression
+	DM_NVN_ENC_THREAD=1 DM_NVN_FAMILY_NOCOMPRESS=1 MTL_DEBUG_LAYER=1 ./t_family_compression
+	DM_NVN_ENC_THREAD=1 DM_NVN_FAMILY_NOCOMPRESS=0 MTL_DEBUG_LAYER=1 ./t_family_compression

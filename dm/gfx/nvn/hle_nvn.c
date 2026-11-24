@@ -1790,9 +1790,11 @@ _Static_assert(DM_QUIT_ARCH_MS == MTL_QUIT_ARCH_MS, "a graceful exit gives the p
 // The first submission's prepare step (mtl_prepare: the prewarm and the pipeline prebuild) loads shaders and builds pipelines and submits no GPU work, so it runs under the lock but outside the
 // graphics gate: inside it, going to the background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start. It stays host work for the guest scheduler. The lock
 // comes before the gate: a second submission waiting for it must not count as in flight, or the suspend waits for it while the first waits to enter the closed gate holding the lock
+#include "../../host/stall_timing.h"
 #include "nvn_queue.inc"
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     ((queue_t *)q)->submits++;
+    DM_STALL_SCOPE("queue submit", n);
     nvn_queue_submit((queue_t *)q,n,(const uint64_t *)h);
 }
 
@@ -1956,6 +1958,16 @@ NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow
 // Frame boundary: on each present, print / write to disk the call count of each NVN function for this frame
 static uint64_t g_prev[NVN_NFUNC];
 static FILE *g_tsv;
+// One genuine game frame at the NVN present boundary, independent of whether
+// the display later accepts it. The AppKit reader never touches g_frame.
+enum { FPS_SAMPLES = 120 };
+static _Atomic uint64_t g_fps_intervals[FPS_SAMPLES], g_fps_frames;
+uint64_t dm_fps_snapshot(uint64_t intervals[FPS_SAMPLES]) {
+    uint64_t n = atomic_load(&g_fps_frames);
+    for (unsigned i = 0; i < FPS_SAMPLES; i++) intervals[i] = atomic_load(&g_fps_intervals[i]);
+    return n;
+}
+
 static void dump_frame(void) {
     static int inited, nframes = 3, calls = 1;
     if (!inited) {
@@ -2082,9 +2094,13 @@ static void power_line(uint64_t frame) {
         if (fs_ != pfs || fr != pfr || ft != pft) LOG("[nvn] same-pass feedback up to frame %llu, per frame: %.1f snapshots taken, %.1f draws reused one, %.1f read the tile (%.1f waited for their pipeline)",
             frame, (fs_ - pfs) / nf, (fr - pfr) / nf, (ft - pft) / nf, (fw - pfw) / nf);
         pfs = fs_; pfr = fr; pft = ft; pfw = fw;
-        void mtl_pool_stats(uint64_t s[6]); static uint64_t pps[6]; uint64_t ps[6]; mtl_pool_stats(ps);   // the tables of handles traced to no slot (nvn_mtl.m pool_gpu)
-        if (ps[0] != pps[0] || ps[2] != pps[2] || ps[3] != pps[3]) LOG("[nvn] pool tables up to frame %llu, per frame: %.2f built whole (%.2f ms), %.2f patched, %.2f kept; of these two %.2f over memory pool changes, %.2f over a new submission",
-            frame, (ps[0] - pps[0]) / nf, (ps[1] - pps[1]) / 1e3 / nf, (ps[2] - pps[2]) / nf, (ps[3] - pps[3]) / nf, (ps[4] - pps[4]) / nf, (ps[5] - pps[5]) / nf);
+        static uint64_t pps[POOL_STATS]; uint64_t ps[POOL_STATS]; mtl_pool_stats(ps);   // the tables of handles traced to no slot (nvn_mtl.m pool_gpu)
+        if (ps[0] != pps[0] || ps[2] != pps[2] || ps[3] != pps[3]) {
+            uint64_t into = ps[6] - pps[6], whole = ps[8] - pps[8] + ps[9] - pps[9] + ps[10] - pps[10];
+            LOG("[nvn] pool tables up to frame %llu, per frame: %.2f built whole (%.2f ms), %.2f patched, %.2f kept; of these two %.2f over memory pool changes, %.2f over a new submission; "
+                "patches into a spare of their table %.2f (%.0f entries written each), copied whole %.2f (no spare of the table %.2f, none finished %.2f, the log past them %.2f), %.3f ms; buffers %.1f MB in tables, %.1f MB spare",
+                frame, (ps[0] - pps[0]) / nf, (ps[1] - pps[1]) / 1e3 / nf, (ps[2] - pps[2]) / nf, (ps[3] - pps[3]) / nf, (ps[4] - pps[4]) / nf, (ps[5] - pps[5]) / nf,
+                into / nf, into ? (double)(ps[7] - pps[7]) / (double)into : 0.0, whole / nf, (ps[8] - pps[8]) / nf, (ps[9] - pps[9]) / nf, (ps[10] - pps[10]) / nf, (ps[11] - pps[11]) / 1e3 / nf, ps[12] / 1048576.0, ps[13] / 1048576.0); }
         memcpy(pps, ps, sizeof pps);
         void mtl_gsb_stats(uint64_t *, uint64_t *); static uint64_t pgn, pgb; uint64_t gn, gb; mtl_gsb_stats(&gn, &gb);   // GPU textures' writes stored into their storage (nvn_mtl.m gsb_store)
         if (gn != pgn) LOG("[nvn] GPU texture storage up to frame %llu: %llu regions, %.1f MB written into their storage on the GPU (%.2f regions, %.2f MB per frame)",
@@ -2661,6 +2677,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         trow(g_frame, "@rec_ms", rec * tb.numer / tb.denom / 1e6); trow(g_frame, "@submit_ms", sub * tb.numer / tb.denom / 1e6);
         tpush(4, rec * tb.numer / tb.denom / 1e6); tpush(5, sub * tb.numer / tb.denom / 1e6);
     }
+    uint64_t fps_frame = atomic_load_explicit(&g_fps_frames, memory_order_relaxed);
+    atomic_store(&g_fps_intervals[fps_frame % FPS_SAMPLES], prev_in ? t0 - prev_in : 0);
+    atomic_store(&g_fps_frames, fps_frame + 1);
     if (prev_in) {
         double fr = (t0 - prev_in) / 1e6, wk = (t0 - prev_out) / 1e6, nv = atomic_exchange(&g_nvn_ns, 0) / 1e6;
         tpush(0, fr); tpush(1, wk); tpush(2, nv);

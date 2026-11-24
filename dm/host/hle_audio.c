@@ -8,6 +8,14 @@
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <stddef.h>
+#include "audio_route.h"
+#include "audio_control.h"
+#include "binaural_51.h"
+#if !TARGET_OS_IPHONE
+#include "apple_spatial_mixer.h"
+#include <CoreAudio/CoreAudio.h>
+#endif
 
 enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
 enum { BK_NONE, BK_AU, BK_NULL };   // what is consuming an output's queue right now (aout.backend)
@@ -20,6 +28,20 @@ typedef struct {
     pthread_mutex_t m;
     void *event;                       // Guest SystemEvent: signaled whenever a buffer is released
     int ch;
+    dm_binaural51 binaural;
+    _Atomic int binaural_active;
+#if !TARGET_OS_IPHONE
+    dm_apple_spatial *apple_spatial; // owned by audio control thread, before/after AudioUnit lifecycle
+    _Atomic int apple_spatial_active;
+    _Atomic int apple_render_failed;
+    _Atomic uint64_t apple_render_failures;
+    int apple_disabled;             // trip on render failure until requested mode changes
+    dm_audio_mode mode_configured;
+    int apple_render_logged;
+#endif
+    int output_ch;                    // actual input channels configured on the AudioUnit
+    uint32_t route_device;             // Mac CoreAudio device ID at last successful configuration
+    uint64_t route_seen;               // generation of default-device / output-format notifications
     _Atomic int state;
     _Atomic uint32_t vol;              // SetAudioOutVolume gain as float bits (1.0 at open), applied to the samples as they are pulled
     aout_buf *q[QMAX]; _Atomic uint32_t q_head, q_tail;       // Pending: written by the game side, read by the output side
@@ -128,15 +150,24 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
 // A six-channel output (front-left front-right center LFE back-left back-right) goes to the device as stereo, downmixed here with the audio renderer's default Q15 coefficients (hle_audren.c):
 // Core Audio's own 6 → 2 mapping keeps only the front pair, so voices on the center (Luigi's Mansion 3) and the back channels were silent. The queue still takes all six guest channels,
 // in blocks through a stack buffer (no allocation in the real-time callback)
-static int device_channels(const aout *a) { return a->ch == 6 ? 2 : a->ch; }
+static int device_channels(const aout *a) { return a->ch == 6 ? (a->output_ch == 6 ? 6 : 2) : a->ch; }
 static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
-    if (a->ch != 6) { pull(a, dst, bytes); return; }
+    // An explicitly configured six-channel output is bit-preserving. Never accidentally
+    // downmix the center, LFE or surround channels twice.
+    if (a->ch != 6 || a->output_ch == 6) { pull(a, dst, bytes); return; }
+    int virtualize = atomic_load_explicit(&a->binaural_active, memory_order_relaxed);
     enum { BLOCK = 128, CF = 32768, CC = 23167, CL = 8224, CB = 23167 };
     int16_t scratch[BLOCK * 6], *out = (int16_t *)dst;
     uint64_t frames = bytes / (2 * sizeof *out);
     while (frames) {
         uint64_t n = frames < BLOCK ? frames : BLOCK;
         pull(a, (uint8_t *)scratch, n * 6 * sizeof *scratch);
+        if (virtualize) {
+            dm_binaural51_process(&a->binaural, scratch, out, (size_t)n);
+            out += 2 * n;
+            frames -= n;
+            continue;
+        }
         for (uint64_t i = 0; i < n; i++) {
             const int16_t *p = scratch + 6 * i;
             int64_t c = (int64_t)p[2] * CC + (int64_t)p[3] * CL;
@@ -149,6 +180,14 @@ static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
     }
 }
 
+#if !TARGET_OS_IPHONE
+// Called *synchronously* by AUSpatialMixer while CoreAudio renders. Never
+// allocate or acquire g_aos_lock here; pull() is the sole queue consumer.
+static void dm_apple_pull51(void *context, int16_t *samples, size_t frames) {
+    aout *a = context;
+    pull(a, (uint8_t *)samples, frames * 6u * sizeof(int16_t));
+}
+#endif
 static _Atomic uint64_t g_render_calls;   // Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
 uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
 static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *bl) {
@@ -170,12 +209,244 @@ static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioT
     if (atomic_load_explicit(&a->hold_device, memory_order_acquire)) {
         memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize);
     } else {
-        pull_device(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
+#if !TARGET_OS_IPHONE
+        if (a->apple_spatial && !atomic_load_explicit(&a->apple_render_failed, memory_order_acquire)) {
+            if (!dm_apple_spatial_render(a->apple_spatial, bl->mBuffers[0].mData,
+                                         bl->mBuffers[0].mDataByteSize / (2u * sizeof(int16_t)))) {
+                // The mixer may already have consumed guest PCM. Never pull
+                // again in this callback; the watchdog rebuilds a fallback.
+                atomic_fetch_add_explicit(&a->apple_render_failures, 1, memory_order_relaxed);
+                atomic_store_explicit(&a->apple_render_failed, 1, memory_order_release);
+                atomic_store_explicit(&a->apple_spatial_active, 0, memory_order_release);
+                memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize);
+            } else {
+                atomic_store_explicit(&a->apple_spatial_active, 1, memory_order_release);
+            }
+        } else
+#endif
+            pull_device(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
         if (a->mute) memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize);
     }
     return noErr;
 }
 #if !TARGET_OS_IPHONE
+// The CoreAudio property callbacks may execute on HAL threads. They never
+// destroy/rebuild an AudioUnit; the watchdog handles that while holding the
+// audio registry lock, after a concurrently starting unit has finished.
+static _Atomic uint64_t g_route_generation;
+// Initialize lazily so the launcher's DM_AUDIO_51=1 opt-in remains the default
+// for existing installations. Afterward the AppKit Audio menu can change it
+// live; neither the device callback nor CoreAudio's HAL listener writes policy.
+static _Atomic int g_audio_mode = -1;
+dm_audio_mode dm_audio_mode_get(void) {
+    int mode = atomic_load_explicit(&g_audio_mode, memory_order_acquire);
+    if (mode < 0) {
+        const char *legacy = getenv("DM_AUDIO_51");
+        int initial = (legacy && !strcmp(legacy, "1")) ? DM_AUDIO_MODE_AUTO : DM_AUDIO_MODE_STEREO;
+        int expected = -1;
+        atomic_compare_exchange_strong_explicit(&g_audio_mode, &expected, initial,
+                                                memory_order_acq_rel, memory_order_acquire);
+        mode = atomic_load_explicit(&g_audio_mode, memory_order_acquire);
+    }
+    return (dm_audio_mode)mode;
+}
+void dm_audio_mode_set(dm_audio_mode mode) {
+    if (mode != DM_AUDIO_MODE_AUTO && mode != DM_AUDIO_MODE_STEREO &&
+        mode != DM_AUDIO_MODE_SURROUND && mode != DM_AUDIO_MODE_BINAURAL &&
+        mode != DM_AUDIO_MODE_APPLE_SPATIAL && mode != DM_AUDIO_MODE_HEAD_TRACKED) return;
+    (void)dm_audio_mode_get();
+    int old = atomic_exchange_explicit(&g_audio_mode, (int)mode, memory_order_acq_rel);
+    if (old == (int)mode) return;
+    // The watchdog owns AudioUnit reconfiguration, not the AppKit thread.
+    atomic_fetch_add_explicit(&g_route_generation, 1, memory_order_release);
+    LOG("audio: requested output mode %s (was %d); route will reconfigure if needed",
+        mode == DM_AUDIO_MODE_STEREO ? "stereo" :
+        mode == DM_AUDIO_MODE_SURROUND ? "prefer 5.1" :
+        mode == DM_AUDIO_MODE_BINAURAL ? "fixed-head virtual surround" :
+        mode == DM_AUDIO_MODE_APPLE_SPATIAL ? "Apple fixed spatial" :
+        mode == DM_AUDIO_MODE_HEAD_TRACKED ? "AirPods head tracking" : "automatic", old);
+}
+static int route_opt_in(void) {
+    dm_audio_mode mode = dm_audio_mode_get();
+    return mode == DM_AUDIO_MODE_AUTO || mode == DM_AUDIO_MODE_SURROUND;
+}
+static AudioDeviceID au_current_device(AudioUnit au) {
+    AudioDeviceID d = kAudioObjectUnknown; UInt32 n = sizeof d;
+    if (AudioUnitGetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                             kAudioUnitScope_Global, 0, &d, &n)) return kAudioObjectUnknown;
+    return d;
+}
+static int au_builtin_speakers(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) return 0;
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    UInt32 transport = 0, size = sizeof transport;
+    return !AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &transport) &&
+        transport == kAudioDeviceTransportTypeBuiltIn;
+}
+static int au_verified_head_tracking_device(AudioDeviceID device) {
+    if (device == kAudioObjectUnknown) return 0;
+    AudioObjectPropertyAddress address = {kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    UInt32 transport = 0, size = sizeof transport;
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &transport) ||
+        (transport != kAudioDeviceTransportTypeBluetooth && transport != kAudioDeviceTransportTypeBluetoothLE))
+        return 0;
+
+    address.mSelector = kAudioDevicePropertyModelUID;
+    CFStringRef model = NULL;
+    size = sizeof model;
+    if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &model) || !model) return 0;
+    char uid[32], trailing;
+    unsigned product = 0, vendor = 0;
+    int matched = CFStringGetCString(model, uid, sizeof uid, kCFStringEncodingUTF8) &&
+        sscanf(uid, "%x %x %c", &product, &vendor, &trailing) == 2 &&
+        vendor == 0x004c && product == 0x2019;   // AirPods 4 verified with live pose and mixer output
+    CFRelease(model);
+    return matched;
+}
+
+// A six-channel device does not necessarily use the game's speaker order.
+// Accept only the explicitly matching 5.1 tags or an *ordered* six-speaker
+// description. In particular, do not infer a 5.1 -> 7.1 channel map merely
+// from eight hardware slots; explicit 7.1 mapping is future work.
+static dm_audio_speaker au_speaker(AudioChannelLabel label) {
+    switch (label) {
+    case kAudioChannelLabel_Left: return DM_AUDIO_SPEAKER_LEFT;
+    case kAudioChannelLabel_Right: return DM_AUDIO_SPEAKER_RIGHT;
+    case kAudioChannelLabel_Center: return DM_AUDIO_SPEAKER_CENTER;
+    case kAudioChannelLabel_LFEScreen: return DM_AUDIO_SPEAKER_LFE;
+    case kAudioChannelLabel_LeftSurround:
+    case kAudioChannelLabel_LeftSurroundDirect:
+    case kAudioChannelLabel_RearSurroundLeft:
+        return DM_AUDIO_SPEAKER_LEFT_SURROUND;
+    case kAudioChannelLabel_RightSurround:
+    case kAudioChannelLabel_RightSurroundDirect:
+    case kAudioChannelLabel_RearSurroundRight:
+        return DM_AUDIO_SPEAKER_RIGHT_SURROUND;
+    default: return DM_AUDIO_SPEAKER_UNKNOWN;
+    }
+}
+static int au_surround_layout(AudioUnit au, unsigned hw_ch) {
+    if (hw_ch != 6) return 0;
+    // AudioChannelLayout already has one description; this holds six total.
+    struct { AudioChannelLayout head; AudioChannelDescription extra[5]; } storage = {0};
+    AudioChannelLayout *l = &storage.head; UInt32 n = sizeof storage;
+    if (AudioUnitGetProperty(au, kAudioUnitProperty_AudioChannelLayout,
+                             kAudioUnitScope_Output, 0, l, &n)) return 0;
+    if (l->mChannelLayoutTag == kAudioChannelLayoutTag_AudioUnit_5_1 ||
+        l->mChannelLayoutTag == kAudioChannelLayoutTag_MPEG_5_1_A) return 1;
+    if (l->mChannelLayoutTag != kAudioChannelLayoutTag_UseChannelDescriptions ||
+        l->mNumberChannelDescriptions != 6 ||
+        n < offsetof(AudioChannelLayout, mChannelDescriptions) +
+            6 * sizeof(AudioChannelDescription)) return 0;
+    dm_audio_speaker labels[6];
+    for (unsigned i = 0; i < 6; ++i)
+        labels[i] = au_speaker(l->mChannelDescriptions[i].mChannelLabel);
+    return dm_audio_layout_is_ordered_51(labels, 6);
+}
+// Snapshot for the native Audio menu. All CoreAudio reads here run on the
+// AppKit/control thread under the registry lock, NEVER in the render callback.
+void dm_audio_get_snapshot(dm_audio_snapshot *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->preference = dm_audio_mode_get();
+    pthread_mutex_lock(&g_aos_lock);
+    aout *a = NULL;
+    for (int i = 0; i < AOMAX; i++) {
+        aout *candidate = g_aos[i];
+        if (!candidate) continue;
+        if (!a || (candidate->backend == BK_AU && (a->backend != BK_AU || candidate->ch > a->ch)))
+            a = candidate;
+    }
+    if (a) {
+        out->output_open = 1;
+        out->source_channels = (unsigned)a->ch;
+        out->effective_channels = a->au ? (unsigned)a->output_ch : 0;
+        out->binaural_active = a->au && (!a->apple_spatial || atomic_load(&a->apple_render_failed)) &&
+            atomic_load_explicit(&a->binaural_active, memory_order_relaxed);
+        out->apple_spatial_configured = a->au && a->apple_spatial != NULL;
+        out->apple_speaker_renderer = dm_apple_spatial_uses_built_in_speakers(a->apple_spatial);
+        out->apple_spatial_active = a->au && atomic_load_explicit(&a->apple_spatial_active, memory_order_relaxed);
+        out->apple_render_failures = atomic_load_explicit(&a->apple_render_failures, memory_order_relaxed);
+        out->callbacks = atomic_load_explicit(&a->cb_n, memory_order_relaxed);
+        out->underruns = atomic_load_explicit(&a->under_n, memory_order_relaxed);
+        out->zero_padded_bytes = atomic_load_explicit(&a->under_b, memory_order_relaxed);
+        out->playing = a->backend == BK_AU && out->callbacks > 0 &&
+                       atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED &&
+                       !atomic_load_explicit(&a->hold_device, memory_order_acquire);
+        if (a->au) {
+            AudioDeviceID dev = au_current_device(a->au);
+            out->device_id = (uint32_t)dev;
+            out->built_in_speakers = au_builtin_speakers(dev);
+            out->head_tracking_available = a->ch == 6 && au_verified_head_tracking_device(dev);
+            if (out->apple_spatial_active && out->head_tracking_available) {
+                out->head_tracking_configured = dm_apple_spatial_head_tracking_requested(a->apple_spatial);
+                out->personalized_active = dm_apple_spatial_personalized(a->apple_spatial);
+            }
+            AudioStreamBasicDescription hw = {0}; UInt32 size = sizeof hw;
+            if (!AudioUnitGetProperty(a->au, kAudioUnitProperty_StreamFormat,
+                    kAudioUnitScope_Output, 0, &hw, &size)) {
+                out->hardware_channels = hw.mChannelsPerFrame;
+                out->device_sample_rate = hw.mSampleRate;
+                out->surround_layout_valid = au_surround_layout(a->au, hw.mChannelsPerFrame);
+            }
+            UInt32 frames = 0; size = sizeof frames;
+            if (!AudioUnitGetProperty(a->au, kAudioDevicePropertyBufferFrameSize,
+                    kAudioUnitScope_Global, 0, &frames, &size))
+                out->device_buffer_frames = frames;
+            if (dev != kAudioObjectUnknown) {
+                AudioObjectPropertyAddress address = {
+                    kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                CFStringRef name = NULL; size = sizeof name;
+                if (!AudioObjectGetPropertyData(dev, &address, 0, NULL, &size, &name) && name) {
+                    CFStringGetCString(name, out->device_name,
+                                      sizeof out->device_name, kCFStringEncodingUTF8);
+                    CFRelease(name);
+                }
+            }
+        }
+        if (!a->au) out->fallback_reason = DM_AUDIO_FALLBACK_OUTPUT_UNAVAILABLE;
+        else if (a->ch == 6 && (out->preference == DM_AUDIO_MODE_APPLE_SPATIAL ||
+                 (out->preference == DM_AUDIO_MODE_HEAD_TRACKED && out->head_tracking_available)) &&
+                 (!out->apple_spatial_configured || atomic_load(&a->apple_render_failed)))
+            out->fallback_reason = DM_AUDIO_FALLBACK_APPLE_MIXER_UNAVAILABLE;
+        else if (a->ch != 6 || out->binaural_active || out->apple_spatial_active)
+            out->fallback_reason = DM_AUDIO_FALLBACK_NONE;
+        else if (out->preference == DM_AUDIO_MODE_BINAURAL)
+            out->fallback_reason = DM_AUDIO_FALLBACK_VIRTUALIZER_INACTIVE;
+        else if (out->preference == DM_AUDIO_MODE_STEREO)
+            out->fallback_reason = DM_AUDIO_FALLBACK_STEREO_SELECTED;
+        else if (out->hardware_channels < 6)
+            out->fallback_reason = DM_AUDIO_FALLBACK_DEVICE_CHANNELS;
+        else if (!out->surround_layout_valid)
+            out->fallback_reason = DM_AUDIO_FALLBACK_UNVERIFIED_LAYOUT;
+        else if (out->effective_channels != 6)
+            out->fallback_reason = DM_AUDIO_FALLBACK_SURROUND_SETUP_FAILED;
+        else out->fallback_reason = DM_AUDIO_FALLBACK_NONE;
+    } else {
+        out->fallback_reason = DM_AUDIO_FALLBACK_WAITING;
+    }
+    pthread_mutex_unlock(&g_aos_lock);
+}
+static unsigned au_route_channels(const aout *a, AudioUnit au, dm_audio_mode desired, int *binaural) {
+    *binaural = 0;
+    if (a->ch != 6) return (unsigned)a->ch;
+    AudioStreamBasicDescription hw = {0}; UInt32 n = sizeof hw;
+    int found = !AudioUnitGetProperty(au, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output, 0, &hw, &n);
+    AudioDeviceID device = au_current_device(au);
+    if (device == kAudioObjectUnknown) return 2;
+    if (desired == DM_AUDIO_MODE_HEAD_TRACKED && !au_verified_head_tracking_device(device)) return 2;
+    dm_audio_render_plan plan = dm_audio_choose_route(desired, 6,
+        found ? hw.mChannelsPerFrame : 0,
+        found && au_surround_layout(au, hw.mChannelsPerFrame));
+    if (au_builtin_speakers(device) && desired == DM_AUDIO_MODE_BINAURAL) return 2;
+    *binaural = plan.virtualize_51;
+    return plan.channels;
+}
 // Mac DefaultOutput's default 512 device frames can exceed the PCM a game has queued, producing zero-filled gaps.
 // Request about 5 ms of device frames, as front_ios.m asks of the iOS audio session; reapply on device or output-rate changes within the supported range.
 // DM_DBG_AU_FRAMES=N asks N frames instead (1024 = the iOS default, which reproduces the crackling)
@@ -200,12 +471,25 @@ static void au_buffer(AudioUnit au, const char *why) {
     LOG("%saudio device buffer: %u frames at %.0f Hz%s (requested %u, status %d)", st ? "[RED] " : "", actual, df.mSampleRate, why ? why : "", fr, (int)st);
 }
 static void au_device_changed(void *ctx, AudioUnit au, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitElement el) {
-    (void)ctx;
+    (void)ctx; (void)au;
+    // HAL notifications can arrive on its own internal threads. Never query,
+    // set the frame size, or rebuild an AudioUnit here: the watchdog owns it.
     if (el == 0 && ((id == kAudioOutputUnitProperty_CurrentDevice && scope == kAudioUnitScope_Global) ||
                    (id == kAudioUnitProperty_StreamFormat && scope == kAudioUnitScope_Output)))
-        au_buffer(au, ", after output changed");
+        atomic_fetch_add_explicit(&g_route_generation, 1, memory_order_release);
 }
 #endif
+static void apple_spatial_dispose(aout *a) {
+#if !TARGET_OS_IPHONE
+    if (a->apple_spatial) {
+        dm_apple_spatial_destroy(a->apple_spatial);
+        a->apple_spatial = NULL;
+    }
+    atomic_store_explicit(&a->apple_spatial_active, 0, memory_order_release);
+#else
+    (void)a;
+#endif
+}
 static void au_dispose(AudioUnit au) {
 #if !TARGET_OS_IPHONE
     // Disposal clears CurrentDevice and notifies listeners. Remove them before the unit tears down its device.
@@ -214,7 +498,10 @@ static void au_dispose(AudioUnit au) {
 #endif
     AudioUnitUninitialize(au); AudioComponentInstanceDispose(au);
 }
-static OSStatus au_create(aout *a) {
+// Each configuration attempt uses a fresh unit. This matters when the 5.1
+// layout is accepted but initialization fails: reusing the half-configured
+// unit for stereo can leave an invalid channel map behind.
+static OSStatus au_create_once(aout *a, int force_stereo) {
     AudioComponentDescription d = {.componentType = kAudioUnitType_Output,
 #if TARGET_OS_IPHONE
                                    .componentSubType = kAudioUnitSubType_RemoteIO,
@@ -223,8 +510,15 @@ static OSStatus au_create(aout *a) {
 #endif
                                    .componentManufacturer = kAudioUnitManufacturer_Apple};
     AudioComponent c = AudioComponentFindNext(NULL, &d);
-    a->au = NULL; if (!c || AudioComponentInstanceNew(c, &a->au)) { a->au = NULL; return -1; }
-    unsigned ch = (unsigned)device_channels(a);
+    a->au = NULL;
+    if (!c || AudioComponentInstanceNew(c, &a->au)) { a->au = NULL; return -1; }
+    unsigned ch = force_stereo && a->ch == 6 ? 2 : (unsigned)device_channels(a);
+    int binaural = 0;
+#if !TARGET_OS_IPHONE
+    dm_audio_mode desired = dm_audio_mode_get();
+    uint64_t generation = atomic_load_explicit(&g_route_generation, memory_order_acquire);
+    ch = force_stereo && a->ch == 6 ? 2 : au_route_channels(a, a->au, desired, &binaural);
+#endif
     AudioStreamBasicDescription f = {.mSampleRate = RATE, .mFormatID = kAudioFormatLinearPCM,
                                      .mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked,
                                      .mBytesPerPacket = 2u * ch, .mFramesPerPacket = 1, .mBytesPerFrame = 2u * ch,
@@ -239,18 +533,71 @@ static OSStatus au_create(aout *a) {
     au_buffer(a->au, NULL);
 #endif
     OSStatus st = AudioUnitSetProperty(a->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof f);
+#if !TARGET_OS_IPHONE
+    if (!st && ch == 6 && a->ch == 6) {
+        // Nintendo sink order (L R C LFE Ls Rs) is AudioUnit 5.1, not AAC 5.1.
+        AudioChannelLayout layout = {0};
+        layout.mChannelLayoutTag = kAudioChannelLayoutTag_AudioUnit_5_1;
+        st = AudioUnitSetProperty(a->au, kAudioUnitProperty_AudioChannelLayout,
+                                  kAudioUnitScope_Input, 0, &layout, sizeof layout);
+    }
+#endif
     if (!st) st = AudioUnitSetProperty(a->au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
     if (!st) st = AudioUnitInitialize(a->au);
-    if (st) { au_dispose(a->au); a->au = NULL; }
+    if (!st) {
+        a->output_ch = (int)ch;
+        // Newly initialized units have not started callback delivery yet.
+        dm_binaural51_init(&a->binaural, RATE);
+        atomic_store_explicit(&a->binaural_active, binaural, memory_order_release);
+#if !TARGET_OS_IPHONE
+        // Apple mixer is exclusive with our generic DSP. It is created only
+        // on the control thread, before CoreAudio starts its output callback.
+        int built_in = au_builtin_speakers(au_current_device(a->au));
+        if (built_in) atomic_store_explicit(&a->binaural_active, 0, memory_order_release);
+        a->mode_configured = desired;
+        a->apple_render_logged = 0;
+        atomic_store_explicit(&a->apple_render_failed, 0, memory_order_release);
+        atomic_store_explicit(&a->apple_spatial_active, 0, memory_order_release);
+        if (!force_stereo && ch == 2 && binaural && !a->apple_disabled &&
+            (desired == DM_AUDIO_MODE_APPLE_SPATIAL || desired == DM_AUDIO_MODE_HEAD_TRACKED)) {
+            int verified_airpods = au_verified_head_tracking_device(au_current_device(a->au));
+            a->apple_spatial = dm_apple_spatial_create(RATE, dm_apple_pull51, a,
+                desired == DM_AUDIO_MODE_HEAD_TRACKED && verified_airpods, verified_airpods, built_in);
+            if (!a->apple_spatial) LOG("audio #%d: Apple SpatialMixer unavailable; using %s", a->id,
+                built_in ? "stereo speaker downmix" : "fixed binaural");
+        }
+        LOG("audio #%d: configured %u-channel PCM%s", a->id, ch,
+            a->apple_spatial ? " with Apple SpatialMixer" : binaural ? " with fixed binaural" : "");
+        a->route_device = (uint32_t)au_current_device(a->au);
+        a->route_seen = generation;
+#endif
+    } else {
+        atomic_store_explicit(&a->binaural_active, 0, memory_order_release);
+        apple_spatial_dispose(a); au_dispose(a->au); a->au = NULL;
+    }
+    return st;
+}
+static OSStatus au_create(aout *a) {
+    OSStatus st = au_create_once(a, 0);
+#if !TARGET_OS_IPHONE
+    // Retry from scratch in stereo after ANY six-channel configuration or
+    // initialization failure. Stereo is the safe mode on any Mac output.
+    if (st && a->ch == 6 && route_opt_in()) {
+        LOG("audio #%d: AudioUnit setup failed (%d), retrying from a fresh stereo unit", a->id, (int)st);
+        st = au_create_once(a, 1);
+    }
+#endif
     return st;
 }
 // OpenAudioOut runs on the game's thread, and creating the AudioUnit takes about 24 KB of stack (measured on the Mac: component lookup, instance, Initialize), more than some game threads have
 // left (Super Mario 3D World's save thread has 8 KB in all; Pokémon: Let's Go overflowed here at startup, PR #36). So it runs on a host thread, once per AudioOut (it predates the big-stack entry, which Start / Stop / Close use)
+static void au_retry(aout *a, uint64_t now);
 static void *au_create_th(void *a) { return (void *)(intptr_t)au_create(a); }
 static void au_open(aout *a) {
     pthread_t t; void *r = NULL;
     if (pthread_create(&t, NULL, au_create_th, a) || dm_host_thread_join(t, &r)) die("AudioUnit setup: cannot start its thread");
-    OSStatus st = (OSStatus)(intptr_t)r; if (st) die("AudioUnit setup failed (status %d)", (int)st);
+    OSStatus st = (OSStatus)(intptr_t)r;
+    if (st) { LOG("[RED] audio #%d: AudioUnit setup failed (%d); silent output will retry", a->id, (int)st); au_retry(a, now_ns()); }
 }
 // Silent sink: consumes in real time at 48 kHz every 5 ms. When more than 100 ms behind (iOS suspended the whole process in the background, SIGSTOP on the Mac), restart the count from now and do not make up the missed time --
 // making it up would pull hundreds of times in one go (seconds' worth), releasing all of the game's buffers and logging hundreds of underruns; a suspended console does not play that stretch either
@@ -283,13 +630,14 @@ static void au_retry(aout *a, uint64_t now) {
     a->retry_at = now + (uint64_t)a->retry_ms * 1000000;
 }
 static void au_replace(aout *a) {
+    apple_spatial_dispose(a);
     au_dispose(a->au);
     OSStatus st = au_create(a);
     if (st) LOG("[RED] audio #%d: no AudioUnit after the media services reset (status %d): this output stays silent", a->id, (int)st);
     a->reset_pending = 0;
 }
 static void aout_free(aout *a) {
-    if (a->au) au_dispose(a->au);
+    if (a->au) { apple_spatial_dispose(a); au_dispose(a->au); }
     dispatch_release(a->notify_sem);
     if (a->rel_sem) dispatch_release(a->rel_sem);
     pthread_mutex_destroy(&a->m); free(a);
@@ -351,6 +699,56 @@ static void stats_drain(void) {
     pthread_mutex_unlock(&g_aos_lock);
     for (int i = 0; i < n; i++) stats_log(&reports[i]);
 }
+#if !TARGET_OS_IPHONE
+// Called only by the watchdog under g_aos_lock. This is the ONLY location
+// that applies a HAL notification to running output configuration. The old
+// callback must stop before the sample width of a new AudioUnit is visible.
+// An in-flight AudioOutputUnitStart owns its unit; defer until it returns.
+static void au_route_refresh(aout *a, uint64_t now) {
+    if (!a->au) return;
+    uint64_t generation = atomic_load_explicit(&g_route_generation, memory_order_acquire);
+    if (a->route_seen == generation && !atomic_load_explicit(&a->apple_render_failed, memory_order_acquire)) return;
+    if (a->start_phase == AU_STARTING || a->start_phase == AU_CANCELED) return;
+    AudioDeviceID dev = au_current_device(a->au);
+    int target_binaural = 0;
+    dm_audio_mode desired = dm_audio_mode_get();
+    unsigned target = a->ch == 6 ? au_route_channels(a, a->au, desired, &target_binaural) : (unsigned)a->ch;
+    int active_binaural = atomic_load_explicit(&a->binaural_active, memory_order_acquire);
+    int apple_failed = atomic_load_explicit(&a->apple_render_failed, memory_order_acquire);
+    if (apple_failed) a->apple_disabled = 1;
+    if (desired != a->mode_configured || (uint32_t)dev != a->route_device) a->apple_disabled = 0;
+    a->route_seen = generation;
+    // A stereo -> virtual-surround switch keeps TWO output channels but still
+    // changes the render path. Rebuild on that transition too, not only when
+    // the device ID or channel count changes. Never reset FIR state while the
+    // old callback can still be executing.
+    // Output-rate changes still need a buffer-size refresh, even when the
+    // configured channel width is unchanged. Do it here, not on a HAL thread.
+    if (a->ch != 6 || ((uint32_t)dev == a->route_device &&
+                       target == (unsigned)a->output_ch &&
+                       (au_builtin_speakers(dev) || target_binaural == active_binaural) &&
+                       desired == a->mode_configured && !apple_failed)) {
+        au_buffer(a->au, ", after output changed");
+        a->route_device = (uint32_t)dev;
+        return;
+    }
+    LOG("audio #%d: output route changed (device %u -> %u, channels %d -> %u, virtualizer %d -> %d); rebuilding",
+        a->id, a->route_device, (unsigned)dev, a->output_ch, target,
+        active_binaural, target_binaural);
+    if (a->backend == BK_AU) {
+        atomic_store_explicit(&a->hold_device, 1, memory_order_release);
+        AudioOutputUnitStop(a->au); a->backend = BK_NONE;
+        if (atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED) null_start(a);
+    } else if (a->start_phase == AU_WAIT_CALLBACK) {
+        AudioOutputUnitStop(a->au);
+    }
+    a->start_phase = AU_IDLE;
+    apple_spatial_dispose(a); au_dispose(a->au); a->au = NULL;
+    OSStatus st = au_create(a);
+    if (st) { LOG("[RED] audio #%d: route rebuild failed (%d); silent sink remains active", a->id, (int)st); au_retry(a, now); }
+    else if (atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED) au_request_start(a);
+}
+#endif
 static void *au_watchdog(void *p) {
     (void)p; uint64_t last = now_ns();
     for (;;) {
@@ -358,7 +756,19 @@ static void *au_watchdog(void *p) {
         pthread_mutex_lock(&g_aos_lock);
         uint64_t t = now_ns(), gap = t - last; last = t;
         for (int i = 0; i < AOMAX; i++) {
-            aout *a = g_aos[i]; if (!a || !a->au) continue;
+            aout *a = g_aos[i]; if (!a) continue;
+            if (!a->au) {
+                if (a->backend == BK_NULL && !g_suspended && t >= a->retry_at) {
+                    OSStatus st = au_create(a);
+                    if (!st) au_request_start(a);
+                    else au_retry(a, t);
+                }
+                continue;
+            }
+#if !TARGET_OS_IPHONE
+            au_route_refresh(a, t);
+            if (!a->au) continue;
+#endif
             uint64_t n = atomic_load_explicit(&a->cb_n, memory_order_relaxed);
             if (a->start_phase == AU_WAIT_CALLBACK) {
                 if (n != a->wd_n) {
@@ -379,6 +789,15 @@ static void *au_watchdog(void *p) {
                 continue;
             }
             if (a->backend != BK_AU) continue;
+#if !TARGET_OS_IPHONE
+            if (a->apple_spatial && !a->apple_render_logged && atomic_load_explicit(&a->apple_spatial_active, memory_order_acquire)) {
+                a->apple_render_logged = 1;
+                int headphones = au_verified_head_tracking_device((AudioDeviceID)a->route_device);
+                LOG("audio #%d: Apple SpatialMixer rendered PCM (%s, head tracking configured %d, personalized HRTF active %d)",
+                    a->id, dm_apple_spatial_uses_built_in_speakers(a->apple_spatial) ? "built-in speakers" : "headphones", headphones && dm_apple_spatial_head_tracking_requested(a->apple_spatial),
+                    headphones && dm_apple_spatial_personalized(a->apple_spatial));
+            }
+#endif
             if (gap > 4ull * WD_TICK_MS * 1000000 || n != a->wd_n) {
                 a->wd_n = n; a->wd_t = t;
             } else if (t - a->wd_t > WD_STALL_MS * 1000000ull) {
@@ -413,6 +832,13 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     aout *a = calloc(1, sizeof *a);
     const char *mute = getenv("DM_AUDIO_MUTE"); a->mute = mute && atoi(mute);
     pthread_mutex_init(&a->m, NULL); a->event = ev; a->ch = ch;
+    dm_binaural51_init(&a->binaural, RATE);
+    atomic_init(&a->binaural_active, 0);
+#if !TARGET_OS_IPHONE
+    atomic_init(&a->apple_spatial_active, 0);
+    atomic_init(&a->apple_render_failed, 0);
+    atomic_init(&a->apple_render_failures, 0);
+#endif
     atomic_init(&a->state, STATE_STOPPED); atomic_init(&a->vol, 0x3f800000u);
     atomic_init(&a->q_head, 0); atomic_init(&a->q_tail, 0);
     atomic_init(&a->rel_head, 0); atomic_init(&a->rel_tail, 0);

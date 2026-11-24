@@ -105,6 +105,7 @@ DM_JIT_SERVE	path	Folder of a `nn::jit` image (`jit.img`, `jit.tsv`, `jit.out`):
 DM_KBD	switch	`=<text>`: the system keyboard returns that text as OK without showing an input box; unset with no window, it returns cancel
 DM_KBD_PLAYER	switch	`own` makes the Mac keyboard player 1 on its own, with controllers from player 2 on (by default the first controller shares player 1 with the keyboard)
 DM_KEYS	switch	Scripted input: `<seconds or f<frame>>:<key>[+key][~hold or ~f<frames>][*count/interval],…` presses buttons, sticks, touches and `Shake` at those times; `=@<file>` reads the steps from the file
+DM_INPUT_SCRIPT_ONLY	diagnostic	`1` isolates guest input to `DM_KEYS` / `DM_CTL` for controlled tests; default off, fixed at process start. Physical buttons/sticks, touch/gestures, live motion and Joy-Con mouse input cannot reach the guest; scripted touch and Shake remain usable. Native app controls/quit remain live. `DM_REC` still records ignored physical player-1 buttons/sticks/touch; it does not record sensor motion or Joy-Con mouse streams. No launcher preference; never enable for normal play.
 DM_LANG	player	Game language as a language code (default `en-US`; the iOS app sets the one the IPA was packed with)
 DM_LAUNCHER	switch	`0` skips the iOS settings screen or the Mac settings window and starts the game at once, with the saved choices (on the Mac also `--no-launcher`)
 DM_LAUNCH_PARAM	path	File whose bytes `oe::TryPopLaunchParameter` returns once; `oe::ExecuteProgram` sets it for the program it starts; a relaunch removes it
@@ -144,7 +145,7 @@ DM_NVN_CBLOG	diagnostic	`=1` logs the command memory the game adds to command bu
 DM_NVN_CLEARLOG	diagnostic	`=1` logs the first 40 colour clears drawn as a triangle (inside a pass, with a partial channel mask or a partial scissor)
 DM_NVN_CMDSTAT	diagnostic	`=1` logs every 300 frames the command recording usage: bytes and records per frame, command memory segment sizes, out-of-memory callbacks, host segments, count and bytes per command type
 DM_NVN_COUNT	diagnostic	`1` counts every NVN call (the counting trampolines) and writes the per-frame call lines; off by default (on with a `DM_NVN_TSV` table that has call rows), the count is an atomic add all recording threads share
-DM_NVN_CPUPROF	diagnostic	1 records CPU wall/time/instruction totals by renderer operation; off by default.
+DM_NVN_CPUPROF	diagnostic	`1` reports inclusive CPU/wall time on the replay thread every five seconds; `2` reports replay windows with a phase totaling at least 50 ms, including maximum call time and thread identity; off by default.
 DM_NVN_CSH_PRESCAN	diagnostic	`0` runs the compute-hoist scan at every pass's first draw even when no dispatch follows (as before; for timing)
 DM_NVN_CS_HOIST	switch	`0` makes a compute dispatch between the draws of a pass end it (on by default: the dispatch runs ahead of the pass when that changes nothing the draws before it read)
 DM_NVN_CUT	switch	`=<draws>`: the replay commits its command buffer every that many draws, between passes (default 64; `0` one command buffer per submission, except the cut after a buffer-to-texture copy)
@@ -158,7 +159,8 @@ DM_NVN_DUAL_WANT	path	`=<file>`: appends the key of each pixel shader a pipeline
 DM_NVN_ENC_LABEL	diagnostic	`=1` labels every render encoder `p<pass in frame> <width>x<height> <first 8 digits of the first draw's fragment key> d<draws>` for Instruments traces
 DM_NVN_ENC_THREAD	player	`1` runs the replay's Metal encoding on a thread of its own while the submit thread goes on translating; on by default on iOS (`0` turns it off), off on macOS
 DM_NVN_END_ALIAS	diagnostic	`1` puts the resource-alias flush back on every encoder's end barrier (each costs the command allocator about 100 KB; the start barriers carry it); `ab` alternates it with the `DM_AB` phases
-DM_NVN_FAMILY_NOCOMPRESS	switch	`0` lets textures of a resolution family (one storage, several sizes) use lossless compression again; on by default they are written uncompressed, as a size reading another's compressed blocks decodes garbage (ASTRAL CHAIN's glow after the pause menu)
+DM_NVN_FAMILY_NOCOMPRESS	switch	`0` enables lossless compression for resolution-family targets; `1` preserves uncompressed storage. Without an override the game profile's `family_compress on|off` chooses it (default off; Ascension remains off pending qualification). Cross-size inherited compressed data can be invalid (ASTRAL CHAIN's glow after the pause menu). Latched at startup.
+DM_NVN_MESH_TGHINT	switch	`1` opts into task/mesh SIMD-width compiler hints for nonzero multiples of 32 threads; default `0` preserves baseline descriptors. Latched for the process; Metal 4 archive keys distinguish hinted pipelines, requiring only affected mesh PSOs to compile once. Shader libraries and chain are unchanged.
 DM_NVN_FAST_WAKE	switch	`0` makes the game's `SyncWait`s wake on the commit feedback handler instead of the GPU's own signal of the fence (on by default)
 DM_NVN_FB_DEPTH	switch	`0` lets a draw that samples the depth attachment of its own render pass read it in the pass, as before (undefined on Apple's GPUs: compressed blocks of what the tiles stored so far); by default a draw that also writes depth or stencil reads a copy, reused until the game's next barrier, and one after a draw of its pass wrote depth ends the pass first
 DM_NVN_FB_SNAP	switch	Draws that sample a colour attachment of their own render pass: unset, those that write it (or follow a write in the pass) read a snapshot, reused until the game's next barrier; `0` none; `all` a fresh snapshot for every draw that samples one (slow, diagnostic, no tile reads)
@@ -378,6 +380,7 @@ DM_SLOWFRAME	diagnostic	`=1` writes the per-frame timing breakdown to the log on
 DM_SPIN	switch	`0` makes the rewriter's spin gate return at once, so guest poll loops spin with no sleep; the gate stays (on by default)
 DM_SPIN_LIST	diagnostic	`=1` makes `patch_nso.py` print every guest poll loop it found and sends through a spin gate
 DM_SPIN_POLL	switch	`=<µs>`: how long a spin-gate wait polls before it sleeps with the yield back-off (default 2000; `0` yields on every pass)
+DM_STALL_TIMING	diagnostic	`=1` logs host queue submissions, GPU fence waits, pipeline worker waits and synchronous reads taking at least 50 ms, with monotonic time and thread ID
 DM_SVC	diagnostic	`=1` logs memory SVCs (`SetHeapSize`, `MapMemory`, `Map`/`UnmapPhysicalMemory`) with their addresses and sizes
 DM_SW2	player	`=1` turns on Switch 2 controllers over Bluetooth LE (Joy-Con 2, Pro Controller 2): the settings window's Switch 2 controllers. Off, no Bluetooth client is created and macOS asks nothing. The host also stays off when the app's Info.plist has no NSBluetoothAlwaysUsageDescription, without which macOS ends the process at the first Bluetooth scan
 DM_SW2_GYRO_DPS	diagnostic	`=<degrees per second per count>` is the Switch 2 controllers' gyro scale (default 0.0607, measured on a left and a right Joy-Con 2; the Switch family's nominal 0.070 turned a 90 degree tilt into 104)
@@ -436,3 +439,6 @@ DM_XCODE_DERIVED_DATA	path	Xcode derived data folder for `build_ipa.sh` (default
 DM_XCODE_PROJECT_DIR	path	Folder of the per-game Xcode project that `build_ipa.sh --prepare-xcode` makes (default `$W/xcode`); the NSP script sets it
 DM_YIELD_BACKOFF	switch	`0` turns off the yield back-off; `=<cap µs>[:<start µs>]` sets its sleep cap and the run of yields after which it starts (default 250:2000)
 DM_YIELD_CLOCK	diagnostic	Clock-reading yield loops: 0 uses ordinary yield backoff, 1 backs off from the start, 2 also sleeps to the predicted end (default)
+DM_NVN_MFX_STAGED_BARRIER	switch	`0` tests omitting the redundant bridge after private MetalFX input staging; default `1` retains baseline. Direct guest textures always retain the bridge.
+DM_NVN_RES_BATCH	switch	`=0`: legacy shared residency/queue lock; default 1 queues retained allocation changes under a short lock and commits separately. Launch-latched; no same-process alternation.
+DM_NVN_VIS_NEED	switch	`=1` or `ab` avoids occlusion counting only when a later reset provably discards it; default 0 retains all-draw counting. Native mesh query-state correctness is always applied.
