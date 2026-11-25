@@ -20,7 +20,7 @@ resources="$app/Contents/Resources"
 mkdir -p "$app/Contents/MacOS" "$resources"
 
 version=1.3
-app_build=4
+app_build=5
 printf '{"version":"%s","build":"%s","revision":"%s"}\n' "$version" "$app_build" "$revision" > "$resources/Release.json"
 /bin/cp "$here/install.py" "$resources/"
 
